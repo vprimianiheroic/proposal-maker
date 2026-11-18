@@ -46,6 +46,10 @@ try { $c.Connect($hostAddr, $port); $open = $true } catch { } finally { $c.Close
   wrapper serialises them to JSON (depth 8) and the AI gets structured `data`. Convert
   dates to strings (`.ToString('s')`). Select only the properties you need, because raw
   WMI objects are huge.
+- **Never return raw `Get-Content` lines or provider objects.** They carry
+  PSPath/PSDrive/PSProvider note properties that make the JSON serialiser
+  crawl huge object graphs (a tool that "hangs" at the end is usually this).
+  Use `[IO.File]::ReadAllLines()`, cast with `[string]`, or `-join`.
 - **Failure**: `throw`. `$ErrorActionPreference` is `Stop`, so any uncaught error fails
   the job and its message goes to `stderr`.
 - **Secrets**: never take passwords as parameters. Declare a credential parameter

@@ -40,5 +40,8 @@ foreach ($l in $r.lines) {
     }
   }
 }
-$hosts = @(Get-Content "$env:SystemRoot\System32\drivers\etc\hosts" -ErrorAction SilentlyContinue | Where-Object { $_ -match '^\s*[^#\s]' })
+# [IO.File] rather than Get-Content: Get-Content strings carry PSDrive/
+# PSProvider note properties that make ConvertTo-Json -Depth 8 effectively hang.
+$hosts = @()
+try { $hosts = @([IO.File]::ReadAllLines("$env:SystemRoot\System32\drivers\etc\hosts") | Where-Object { $_ -match '^\s*[^#\s]' }) } catch { }
 [pscustomobject]@{ adapters = @($adapters); routes = @($routes | Select-Object -First 60); hosts_file_entries = $hosts }

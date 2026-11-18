@@ -259,32 +259,6 @@ foreach ($c in $toolCases) {
   }
 }
 
-Step 'diag: network_config traced' {
-  $src = (Api GET 'tools/network_config').script
-  $j = (Run-Tool -Tool '' -Script ("Set-PSDebug -Trace 1`n" + $src) -Timeout 30 -Wait 45)[0]
-  $lines = @("$($j.result.stdout)`n$($j.result.stderr)" -split "`r?`n" | Where-Object { $_ })
-  Write-Host ("network_config trace (last 40 lines), status=$($j.status):`n" + (($lines | Select-Object -Last 40) -join "`n"))
-  "status=$($j.status)"
-}
-
-Step 'diag: network_config sections timing' {
-  $parts = [ordered]@{
-    nics    = '$sw=[Diagnostics.Stopwatch]::StartNew(); $n=@([System.Net.NetworkInformation.NetworkInterface]::GetAllNetworkInterfaces()); [pscustomobject]@{count=$n.Count; ms=$sw.ElapsedMilliseconds}'
-    ipprops = '$sw=[Diagnostics.Stopwatch]::StartNew(); foreach($n in [System.Net.NetworkInformation.NetworkInterface]::GetAllNetworkInterfaces()){ $p=$n.GetIPProperties(); $null=$p.DnsAddresses; $null=$p.GatewayAddresses; $null=$p.UnicastAddresses }; [pscustomobject]@{ms=$sw.ElapsedMilliseconds}'
-    dhcp    = '$sw=[Diagnostics.Stopwatch]::StartNew(); foreach($n in [System.Net.NetworkInformation.NetworkInterface]::GetAllNetworkInterfaces()){ $null=$n.GetIPProperties().DhcpServerAddresses }; [pscustomobject]@{ms=$sw.ElapsedMilliseconds}'
-    v4      = '$sw=[Diagnostics.Stopwatch]::StartNew(); foreach($n in [System.Net.NetworkInformation.NetworkInterface]::GetAllNetworkInterfaces()){ try { $null=$n.GetIPProperties().GetIPv4Properties() } catch {} }; [pscustomobject]@{ms=$sw.ElapsedMilliseconds}'
-    route   = '$sw=[Diagnostics.Stopwatch]::StartNew(); $r=Invoke-RmmNative "route.exe" "print","-4"; [pscustomobject]@{lines=$r.lines.Count; ms=$sw.ElapsedMilliseconds}'
-    speedmac = '$sw=[Diagnostics.Stopwatch]::StartNew(); foreach($n in [System.Net.NetworkInformation.NetworkInterface]::GetAllNetworkInterfaces()){ $null=$n.Speed; $null=$n.GetPhysicalAddress().GetAddressBytes(); $null=$n.OperationalStatus }; [pscustomobject]@{ms=$sw.ElapsedMilliseconds}'
-    hosts   = '$sw=[Diagnostics.Stopwatch]::StartNew(); $h=@(Get-Content "$env:SystemRoot\System32\drivers\etc\hosts"); [pscustomobject]@{lines=$h.Count; ms=$sw.ElapsedMilliseconds}'
-    tojson  = '$sw=[Diagnostics.Stopwatch]::StartNew(); $x=foreach($n in [System.Net.NetworkInformation.NetworkInterface]::GetAllNetworkInterfaces()){ [pscustomobject]@{ n=$n.Name; ip=@($n.GetIPProperties().UnicastAddresses | ForEach-Object { "$($_.Address)/$($_.PrefixLength)" }) } }; $null = $x | ConvertTo-Json -Depth 8; [pscustomobject]@{ms=$sw.ElapsedMilliseconds}'
-  }
-  $out = foreach ($k in $parts.Keys) {
-    $j = (Run-Tool -Tool '' -Script $parts[$k] -Timeout 25 -Wait 40)[0]
-    "$k=$($j.status):$($j.result.data | ConvertTo-Json -Compress)"
-  }
-  $out -join ' | '
-}
-
 Step 'tool process_kill (spawned process)' {
   $p = Start-Process -FilePath ping.exe -ArgumentList '-n', '600', '127.0.0.1' -PassThru -WindowStyle Hidden
   $j = (Run-Tool 'process_kill' @{ pid = $p.Id })[0]
