@@ -14,15 +14,20 @@ import (
 // Config lives in <DataDir>/agent.json. On Windows the installer restricts
 // the directory to SYSTEM and Administrators because it holds the agent secret.
 type Config struct {
-	ServerURL      string `json:"server_url"`
-	ServerPubKey   string `json:"server_public_key"`        // base64 Ed25519; jobs must be signed by it
-	TLSPinSHA256   string `json:"tls_pin_sha256,omitempty"` // hex SHA-256 of server cert SPKI (for self-signed certs)
-	EnrollToken    string `json:"enroll_token,omitempty"`   // removed after successful enrollment
-	AgentID        string `json:"agent_id,omitempty"`
-	AgentSecret    string `json:"agent_secret,omitempty"`
-	MaxConcurrent  int    `json:"max_concurrent,omitempty"`
-	PowerShellPath string `json:"powershell_path,omitempty"` // override interpreter (testing / pwsh)
-	LogLevel       string `json:"log_level,omitempty"`
+	ServerURL string `json:"server_url"`
+	// ServerURLs is the ordered failover list pushed by the server
+	// (primary first). InstallURL is the address given at install time and
+	// is always kept as a last resort so a bad push can't strand the agent.
+	ServerURLs     []string `json:"server_urls,omitempty"`
+	InstallURL     string   `json:"install_url,omitempty"`
+	ServerPubKey   string   `json:"server_public_key"`        // base64 Ed25519; jobs must be signed by it
+	TLSPinSHA256   string   `json:"tls_pin_sha256,omitempty"` // hex SHA-256 of server cert SPKI (for self-signed certs)
+	EnrollToken    string   `json:"enroll_token,omitempty"`   // removed after successful enrollment
+	AgentID        string   `json:"agent_id,omitempty"`
+	AgentSecret    string   `json:"agent_secret,omitempty"`
+	MaxConcurrent  int      `json:"max_concurrent,omitempty"`
+	PowerShellPath string   `json:"powershell_path,omitempty"` // override interpreter (testing / pwsh)
+	LogLevel       string   `json:"log_level,omitempty"`
 
 	path string
 }
@@ -64,6 +69,9 @@ func (c *Config) Validate() error {
 	if c.AgentID == "" && c.EnrollToken == "" {
 		return errors.New("not enrolled and no enroll_token configured")
 	}
+	if c.InstallURL == "" {
+		c.InstallURL = c.ServerURL
+	}
 	if c.MaxConcurrent <= 0 {
 		c.MaxConcurrent = 4
 	}
@@ -97,4 +105,18 @@ func (c *Config) Save(path string) error {
 	}
 	c.path = path
 	return nil
+}
+
+// Endpoints returns the de-duplicated failover order.
+func (c *Config) Endpoints() []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, u := range append(append([]string{c.ServerURL}, c.ServerURLs...), c.InstallURL) {
+		u = strings.TrimRight(strings.TrimSpace(u), "/")
+		if u != "" && !seen[u] && (strings.HasPrefix(u, "https://") || strings.HasPrefix(u, "http://")) {
+			seen[u] = true
+			out = append(out, u)
+		}
+	}
+	return out
 }

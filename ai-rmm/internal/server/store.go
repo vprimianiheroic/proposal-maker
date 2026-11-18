@@ -29,30 +29,34 @@ type Agent struct {
 	LastIP     string         `json:"last_ip"`
 	Notes      string         `json:"notes,omitempty"`
 	Disabled   bool           `json:"disabled,omitempty"`
+	// OfflineNotified is set once an agent_offline event fired, cleared when it returns.
+	OfflineNotified bool `json:"offline_notified,omitempty"`
 }
 
 type JobRecord struct {
-	ID             string              `json:"id"`
-	BatchID        string              `json:"batch_id"`
-	AgentID        string              `json:"agent_id"`
-	Hostname       string              `json:"hostname"`
-	Tool           string              `json:"tool"`
-	ToolVersion    int                 `json:"tool_version"`
-	Risk           protocol.Risk       `json:"risk"`
-	Params         json.RawMessage     `json:"params"`
-	Script         string              `json:"script"`
-	TimeoutSec     int                 `json:"timeout_sec"`
-	Reason         string              `json:"reason"`
-	RequestedBy    string              `json:"requested_by"`
-	ApprovalReason string              `json:"approval_reason,omitempty"` // why a human must approve
-	DecidedBy      string              `json:"decided_by,omitempty"`
-	Status         string              `json:"status"`
-	CreatedAt      int64               `json:"created_at"`
-	QueueDeadline  int64               `json:"queue_deadline"`
-	DispatchedAt   int64               `json:"dispatched_at,omitempty"`
-	ExpiresAt      int64               `json:"expires_at,omitempty"`
-	FinishedAt     int64               `json:"finished_at,omitempty"`
-	Result         *protocol.JobResult `json:"result,omitempty"`
+	ID               string              `json:"id"`
+	BatchID          string              `json:"batch_id"`
+	AgentID          string              `json:"agent_id"`
+	Hostname         string              `json:"hostname"`
+	Tool             string              `json:"tool"`
+	ToolVersion      int                 `json:"tool_version"`
+	Risk             protocol.Risk       `json:"risk"`
+	Params           json.RawMessage     `json:"params"`
+	Kind             string              `json:"kind,omitempty"`
+	Script           string              `json:"script"`
+	CredentialParams []string            `json:"credential_params,omitempty"`
+	TimeoutSec       int                 `json:"timeout_sec"`
+	Reason           string              `json:"reason"`
+	RequestedBy      string              `json:"requested_by"`
+	ApprovalReason   string              `json:"approval_reason,omitempty"` // why a human must approve
+	DecidedBy        string              `json:"decided_by,omitempty"`
+	Status           string              `json:"status"`
+	CreatedAt        int64               `json:"created_at"`
+	QueueDeadline    int64               `json:"queue_deadline"`
+	DispatchedAt     int64               `json:"dispatched_at,omitempty"`
+	ExpiresAt        int64               `json:"expires_at,omitempty"`
+	FinishedAt       int64               `json:"finished_at,omitempty"`
+	Result           *protocol.JobResult `json:"result,omitempty"`
 }
 
 type APIKey struct {
@@ -95,12 +99,16 @@ type Release struct {
 
 // State is everything persisted in state.json.
 type State struct {
-	Agents       map[string]*Agent       `json:"agents"`
-	Jobs         map[string]*JobRecord   `json:"jobs"`
-	Tools        map[string]*Tool        `json:"tools"` // custom tools only; builtins come from the binary
-	APIKeys      map[string]*APIKey      `json:"api_keys"`
-	EnrollTokens map[string]*EnrollToken `json:"enroll_tokens"`
-	Releases     []*Release              `json:"releases"`
+	Agents       map[string]*Agent            `json:"agents"`
+	Jobs         map[string]*JobRecord        `json:"jobs"`
+	Tools        map[string]*Tool             `json:"tools"` // custom tools only; builtins come from the binary
+	APIKeys      map[string]*APIKey           `json:"api_keys"`
+	EnrollTokens map[string]*EnrollToken      `json:"enroll_tokens"`
+	Releases     []*Release                   `json:"releases"`
+	Credentials  map[string]*StoredCredential `json:"credentials"`
+	Devices      map[string]*NetDevice        `json:"devices"`
+	Schedules    map[string]*Schedule         `json:"schedules"`
+	Events       []*Event                     `json:"events"`
 }
 
 func newState() *State {
@@ -110,6 +118,9 @@ func newState() *State {
 		Tools:        map[string]*Tool{},
 		APIKeys:      map[string]*APIKey{},
 		EnrollTokens: map[string]*EnrollToken{},
+		Credentials:  map[string]*StoredCredential{},
+		Devices:      map[string]*NetDevice{},
+		Schedules:    map[string]*Schedule{},
 	}
 }
 
@@ -148,6 +159,15 @@ func loadStore(dir string, retention int) (*store, error) {
 	}
 	if s.st.EnrollTokens == nil {
 		s.st.EnrollTokens = n.EnrollTokens
+	}
+	if s.st.Credentials == nil {
+		s.st.Credentials = n.Credentials
+	}
+	if s.st.Devices == nil {
+		s.st.Devices = n.Devices
+	}
+	if s.st.Schedules == nil {
+		s.st.Schedules = n.Schedules
 	}
 	return s, nil
 }

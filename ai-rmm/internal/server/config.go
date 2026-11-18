@@ -30,6 +30,17 @@ type Config struct {
 	DefaultPolicy Policy            `json:"default_policy"`
 	GroupPolicies map[string]Policy `json:"group_policies"`
 
+	// AlertWebhooks receive a JSON POST {"text","event","data"} for agent
+	// offline/online, device down/up and approval-needed events. Slack
+	// incoming webhooks accept this format as-is.
+	AlertWebhooks []string `json:"alert_webhooks"`
+	// AgentServerURLs is pushed to every agent as its ordered list of server
+	// addresses (primary first, then fallbacks such as an IP or a second DNS
+	// name). Change it here to migrate agents to a new address safely.
+	AgentServerURLs []string `json:"agent_server_urls"`
+	// Timezone for schedules (IANA name, e.g. America/Chicago). Default: server local time.
+	Timezone string `json:"timezone"`
+
 	JobRetention    int `json:"job_retention"`     // finished jobs kept in state.json
 	OfflineAfterSec int `json:"offline_after_sec"` // agent considered offline after this
 	DefaultQueueMin int `json:"default_queue_min"` // how long a job waits for an offline agent

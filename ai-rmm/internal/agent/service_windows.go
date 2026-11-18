@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"golang.org/x/sys/windows/svc"
@@ -154,7 +155,186 @@ func InstallService(cfg *Config, inPlace bool) error {
 	if err := s.SetRecoveryActionsOnNonCrashFailures(true); err != nil {
 		return err
 	}
-	return s.Start()
+	if err := s.Start(); err != nil {
+		return err
+	}
+	if err := installWatchdog(dst); err != nil {
+		fmt.Fprintln(os.Stderr, "warning: watchdog task not installed:", err)
+	}
+	return nil
+}
+
+const watchdogTask = "AIRMM Watchdog"
+
+// installWatchdog keeps a separate copy of a known-good build and a SYSTEM
+// scheduled task that runs it every 10 minutes. The copy is only refreshed
+// after a new build has proven it can reach the server, so a bad update
+// can't take the watchdog down with it.
+func installWatchdog(agentExe string) error {
+	wd := filepath.Join(filepath.Dir(agentExe), "rmm-watchdog.exe")
+	if err := copyPlain(agentExe, wd); err != nil && !fileExists(wd) {
+		return err
+	}
+	out, err := exec.Command("schtasks.exe", "/create", "/tn", watchdogTask, "/tr", `"`+wd+`" watchdog`,
+		"/sc", "minute", "/mo", "10", "/ru", "SYSTEM", "/rl", "HIGHEST", "/f").CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("%v: %s", err, out)
+	}
+	return nil
+}
+
+func fileExists(p string) bool {
+	_, err := os.Stat(p)
+	return err == nil
+}
+
+var lastPromote time.Time
+
+// promoteWatchdog refreshes the watchdog copy from the running (healthy) build.
+func promoteWatchdog() {
+	if time.Since(lastPromote) < 10*time.Minute || !IsService() {
+		return
+	}
+	lastPromote = time.Now()
+	self, err := os.Executable()
+	if err != nil {
+		return
+	}
+	wd := filepath.Join(filepath.Dir(self), "rmm-watchdog.exe")
+	si, err1 := os.Stat(self)
+	wi, err2 := os.Stat(wd)
+	if err1 != nil || (err2 == nil && !wi.ModTime().Before(si.ModTime())) {
+		return
+	}
+	tmp := wd + ".tmp"
+	if copyPlain(self, tmp) == nil {
+		_ = os.Remove(wd)
+		_ = os.Rename(tmp, wd)
+	}
+}
+
+// Watchdog is run by the scheduled task. It never needs the server: it
+// only makes sure the agent service exists, is enabled and running, and
+// rolls back a self-update that never managed to reach the server.
+func Watchdog() error {
+	dataDir := DefaultDataDir()
+	logf := func(format string, args ...interface{}) {
+		f, err := os.OpenFile(filepath.Join(dataDir, "watchdog.log"), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+		if err == nil {
+			if st, _ := f.Stat(); st != nil && st.Size() > 1<<20 {
+				f.Truncate(0)
+			}
+			fmt.Fprintf(f, "%s %s\r\n", time.Now().UTC().Format(time.RFC3339), fmt.Sprintf(format, args...))
+			f.Close()
+		}
+	}
+	self, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	agentExe := filepath.Join(filepath.Dir(self), "rmm-agent.exe")
+	m, err := mgr.Connect()
+	if err != nil {
+		return err
+	}
+	defer m.Disconnect()
+
+	s, err := m.OpenService(ServiceName)
+	if err != nil {
+		if !fileExists(DefaultConfigPath()) {
+			return nil // never configured / deliberately purged: nothing to restore
+		}
+		logf("agent service missing; re-registering")
+		if !fileExists(agentExe) {
+			if err := copyPlain(self, agentExe); err != nil {
+				logf("restore binary: %v", err)
+				return err
+			}
+		}
+		out, err := exec.Command(agentExe, "install", "--in-place").CombinedOutput()
+		logf("reinstall: %v %s", err, strings.TrimSpace(string(out)))
+		return err
+	}
+	defer s.Close()
+
+	if c, err := s.Config(); err == nil && c.StartType == mgr.StartDisabled {
+		c.StartType = mgr.StartAutomatic
+		if err := s.UpdateConfig(c); err == nil {
+			logf("agent service was disabled; re-enabled")
+		}
+	}
+
+	marker := filepath.Join(dataDir, updateMarker)
+	if mi, err := os.Stat(marker); err == nil && time.Since(mi.ModTime()) > 15*time.Minute && fileExists(agentExe+".old") {
+		logf("self-update never reached the server within 15 minutes; rolling back")
+		_ = stopService(s)
+		_ = os.Remove(agentExe + ".bad")
+		if err := os.Rename(agentExe, agentExe+".bad"); err == nil {
+			if err := os.Rename(agentExe+".old", agentExe); err != nil {
+				_ = os.Rename(agentExe+".bad", agentExe)
+				logf("rollback failed: %v", err)
+			}
+		}
+		_ = os.Remove(marker)
+		return s.Start()
+	}
+
+	st, err := s.Query()
+	if err != nil {
+		return err
+	}
+	switch st.State {
+	case svc.Stopped:
+		logf("agent service was stopped; starting")
+		return s.Start()
+	case svc.Running:
+		// Running but silent for an hour: hung process or wedged network
+		// stack. A restart is cheap and often fixes it.
+		if lc, err := os.Stat(filepath.Join(dataDir, "last_contact")); err == nil && time.Since(lc.ModTime()) > time.Hour {
+			if fi, err := os.Stat(filepath.Join(dataDir, "watchdog.restart")); err != nil || time.Since(fi.ModTime()) > time.Hour {
+				_ = os.WriteFile(filepath.Join(dataDir, "watchdog.restart"), nil, 0o600)
+				logf("no server contact for %s; restarting agent service", time.Since(lc.ModTime()).Round(time.Minute))
+				_ = stopService(s)
+				return s.Start()
+			}
+		}
+	}
+	return nil
+}
+
+// RunBootstrap is the entry point of the one-shot AIRMMSetup service that
+// deploy_agent creates on a target: install from the config next to the
+// binary, record the outcome for the deployer, exit.
+func RunBootstrap() error {
+	return svc.Run(setupServiceName, &bootstrapHandler{})
+}
+
+const setupServiceName = "AIRMMSetup"
+
+type bootstrapHandler struct{}
+
+func (bootstrapHandler) Execute(_ []string, req <-chan svc.ChangeRequest, st chan<- svc.Status) (bool, uint32) {
+	st <- svc.Status{State: svc.Running}
+	self, _ := os.Executable()
+	dir := filepath.Dir(self)
+	err := func() error {
+		cfg, err := LoadConfig(filepath.Join(dir, "agent.json"))
+		if err != nil {
+			return err
+		}
+		return InstallService(cfg, false)
+	}()
+	msg := "ok"
+	if err != nil {
+		msg = "error: " + err.Error()
+	}
+	_ = os.WriteFile(filepath.Join(dir, "bootstrap-result.txt"), []byte(msg), 0o600)
+	// Don't leave the single-use token lying around on the target.
+	_ = os.Remove(filepath.Join(dir, "agent.json"))
+	if err != nil {
+		return true, 1
+	}
+	return false, 0
 }
 
 func UninstallService(purge bool) error {
@@ -163,6 +343,7 @@ func UninstallService(purge bool) error {
 		return err
 	}
 	defer m.Disconnect()
+	_ = exec.Command("schtasks.exe", "/delete", "/tn", watchdogTask, "/f").Run()
 	s, err := m.OpenService(ServiceName)
 	if err == nil {
 		_ = stopService(s)

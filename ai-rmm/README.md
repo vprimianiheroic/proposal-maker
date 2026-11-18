@@ -14,13 +14,36 @@ administration needs, without the console sprawl.
   agent API, a REST API, an **MCP endpoint** that Claude or any MCP client
   uses to manage the fleet, and a small web console where humans approve jobs.
 - **Snap-in tools**: each capability is a single `.ps1` file with a JSON
-  header (name, description, risk level, parameter schema). 41 tools ship
-  built in. The AI can write new ones at runtime. They start as drafts and
+  header (name, description, risk level, parameter schema). 42 PowerShell
+  tools and 2 native tools ship built in. The AI can write new ones at runtime. They start as drafts and
   run only with human approval until an admin publishes them.
+- **Self-propagating rollout**: a managed machine can push-install the agent
+  to the rest of the domain (PsExec-style over SMB/ADMIN$). It uses a
+  deployment credential held in the server's encrypted vault, which the AI
+  refers to by name but can never read, and mints a single-use enrollment
+  token for each target. GPO, MSI and script installs still work.
+- **Patching**: update status, installs with optional reboot, a fleet
+  patch-compliance report, and approved recurring schedules that act as
+  maintenance windows.
+- **Never lose contact**: a watchdog scheduled task restarts or re-creates the
+  service and rolls back a self-update that can't reach the server. Agents
+  fail over between server addresses, and the server can push a new address
+  list. Updates are signed and can be canaried by group. An agent running the
+  wrong build for its OS (for example x86 on x64) is moved to the right one
+  automatically.
+- **Network monitoring**: agents act as collectors for switches, APs,
+  firewalls, UPSs, printers and anything else with an IP. They use ping, TCP
+  and SNMP v2c/v3, including interface up/down and error counts. Subnet
+  discovery is built in. Alerts go to webhooks (Slack, Teams via workflow,
+  and others).
+- **No AI inside**: the platform exposes MCP and REST. Bring any MCP client
+  (Claude Code, Claude Desktop, the Claude API/Agent SDK); no model API key
+  lives in the RMM.
 - **Guardrails**: every job carries a written reason and lands in an
   append-only audit log. Per-group policy decides which risk levels run
   without approval. Agents refuse any job not signed by the server's Ed25519
-  key, so a compromised database or network path cannot push code.
+  key, so a compromised database or network path cannot push code. Secrets
+  are redacted from tool output before it leaves the machine.
 
 ```
  Claude / MCP client ──HTTPS+API key──▶ ┌─────────────┐ ◀──HTTPS long-poll── rmm-agent (SYSTEM)
@@ -71,6 +94,7 @@ AI-written tools, manage groups and create enrollment tokens.
 
 | Tool | Risk | What it does |
 |---|---|---|
+| `ad_computers` | read | List enabled Active Directory computer accounts that logged on within N days, with DNS name, OS and last logon. |
 | `ad_locked_out_users` | read | List currently locked-out AD user accounts. |
 | `ad_stale_computers` | read | AD computer accounts whose lastLogonTimestamp is older than N days (candidates for cleanup), with OS and enabled state. |
 | `ad_user_lookup` | read | Look up Active Directory users by sAMAccountName, UPN, display name or email (wildcards allowed). |
@@ -96,17 +120,19 @@ AI-written tools, manage groups and create enrollment tokens.
 | `system_info` | read | OS, hardware, domain, uptime, memory, BIOS/serial, PowerShell version and pending-reboot state. |
 | `test_connectivity` | read | From this machine: DNS-resolve a host, ping it, and optionally test TCP ports. |
 | `time_sync_status` | read | Windows Time service status and configured source (w32tm), plus offset against a reference host. |
-| `windows_update_status` | read | Recently installed hotfixes, last update install time, WSUS/policy configuration, and (optionally) a live search for missing updates via the Windows Update Agent. |
+| `windows_update_status` | read | Recently installed hotfixes, pending reboot, WSUS/policy configuration, and (optionally) a live search for missing updates via the Windows Update Agent (can take minutes). |
 | `abort_reboot` | change | Cancel a pending scheduled shutdown/restart (shutdown /a), e.g. |
 | `ad_unlock_user` | change | Unlock a locked-out AD user account. |
 | `clear_temp_files` | change | Free disk space by deleting old files from Windows temp, user temp folders, Windows Update download cache and (optionally) the recycle bin. |
 | `flush_dns` | change | Flush the DNS resolver cache and optionally re-register this machine's DNS records. |
 | `gpupdate` | change | Refresh Group Policy (gpupdate /force by default) and return the summary of applied computer GPOs (gpresult). |
+| `network_scan` (native) | change | Discover devices on a subnet: ping sweep, TCP ports, reverse DNS, SNMP identity and a device-type guess. |
 | `process_kill` | change | Terminate a process by PID or by exact image name (e.g. |
 | `restart_print_spooler` | change | Fix stuck printing: stop the spooler, optionally purge all queued jobs, start it again. |
 | `service_control` | change | Start, stop or restart a Windows service, and/or change its start mode. |
 | `time_resync` | change | Force a Windows Time resync (w32tm /resync), restarting W32Time if needed. |
 | `ad_set_user_enabled` | high | Enable or disable an AD user account (e.g. |
+| `deploy_agent` (native) | high | Push-install the agent to other domain computers over SMB/ADMIN$ and remote service control, using a vault credential and single-use enrollment tokens. |
 | `install_msi` | high | Download an MSI or EXE installer from an internal URL or UNC path, verify its SHA-256, and install silently. |
 | `install_windows_updates` | high | Search, download and install applicable Windows updates through the Windows Update Agent (honours WSUS). |
 | `reboot` | high | Restart the machine after a delay, with a message to logged-on users. |
@@ -115,9 +141,14 @@ AI-written tools, manage groups and create enrollment tokens.
 
 ## MCP tools exposed to the AI
 
-`list_agents`, `get_agent`, `list_tools`, `get_tool`, `run_tool`,
-`run_powershell`, `get_results`, `list_jobs`, `list_pending_approvals`,
-`cancel_job`, `save_tool`, `set_agent_notes`, `get_audit_log`.
+| Area | Tools |
+|---|---|
+| Fleet | `list_agents`, `get_agent`, `set_agent_notes`, `get_events`, `get_audit_log` |
+| Running work | `list_tools`, `get_tool`, `run_tool`, `run_powershell`, `get_results`, `list_jobs`, `list_pending_approvals`, `cancel_job` |
+| Extending | `save_tool` (drafts), `list_credentials` |
+| Rollout | `find_unmanaged_computers`, `deploy_agent` |
+| Patching & scheduling | `patch_report`, `list_schedules`, `save_schedule`, `set_schedule_enabled`, `delete_schedule` |
+| Network | `list_network_devices`, `get_network_device`, `save_network_device`, `remove_network_device` (discovery via `run_tool network_scan`) |
 
 ## Layout
 

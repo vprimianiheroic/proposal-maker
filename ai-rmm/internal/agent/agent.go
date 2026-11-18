@@ -41,6 +41,11 @@ type Agent struct {
 	sem      chan struct{}
 	wg       sync.WaitGroup
 
+	epMu      sync.Mutex
+	epIdx     int
+	mon       *collector
+	lastTouch time.Time
+
 	// RestartRequested is set when a self-update has been staged; the caller
 	// should exit with a non-zero code so the service manager restarts it.
 	RestartRequested bool
@@ -57,6 +62,7 @@ func New(cfg *Config, version, variant string) (*Agent, error) {
 		sem: make(chan struct{}, cfg.MaxConcurrent),
 	}
 	a.client = &http.Client{Timeout: 90 * time.Second, Transport: a.transport()}
+	a.mon = newCollector(a)
 	return a, nil
 }
 
@@ -95,7 +101,8 @@ func (a *Agent) do(ctx context.Context, method, path string, body, out interface
 		}
 		rdr = bytes.NewReader(b)
 	}
-	req, err := http.NewRequestWithContext(ctx, method, a.Cfg.ServerURL+path, rdr)
+	base := a.endpoint()
+	req, err := http.NewRequestWithContext(ctx, method, base+path, rdr)
 	if err != nil {
 		return err
 	}
@@ -106,6 +113,9 @@ func (a *Agent) do(ctx context.Context, method, path string, body, out interface
 	}
 	resp, err := a.client.Do(req)
 	if err != nil {
+		if ctx.Err() == nil {
+			a.failover(base, err)
+		}
 		return err
 	}
 	defer resp.Body.Close()
@@ -126,6 +136,82 @@ type httpError struct {
 
 func (e *httpError) Error() string { return fmt.Sprintf("server returned %d: %s", e.Code, e.Msg) }
 
+// endpoint returns the server address currently in use.
+func (a *Agent) endpoint() string {
+	a.epMu.Lock()
+	defer a.epMu.Unlock()
+	eps := a.Cfg.Endpoints()
+	if len(eps) == 0 {
+		return a.Cfg.ServerURL
+	}
+	return eps[a.epIdx%len(eps)]
+}
+
+// failover moves to the next known server address after a network error.
+func (a *Agent) failover(failed string, err error) {
+	a.epMu.Lock()
+	defer a.epMu.Unlock()
+	eps := a.Cfg.Endpoints()
+	if len(eps) < 2 || eps[a.epIdx%len(eps)] != failed {
+		return
+	}
+	a.epIdx = (a.epIdx + 1) % len(eps)
+	log.Printf("server %s unreachable (%v); trying %s", failed, err, eps[a.epIdx])
+}
+
+// setServerURLs stores a server-pushed address list.
+func (a *Agent) setServerURLs(urls []string) {
+	var clean []string
+	for _, u := range urls {
+		u = strings.TrimRight(strings.TrimSpace(u), "/")
+		if strings.HasPrefix(u, "https://") || strings.HasPrefix(u, "http://") {
+			clean = append(clean, u)
+		}
+	}
+	if len(clean) == 0 {
+		return
+	}
+	a.epMu.Lock()
+	same := clean[0] == a.Cfg.ServerURL && strings.Join(clean[1:], ",") == strings.Join(a.Cfg.ServerURLs, ",")
+	if !same {
+		cur := ""
+		if eps := a.Cfg.Endpoints(); len(eps) > 0 {
+			cur = eps[a.epIdx%len(eps)]
+		}
+		a.Cfg.ServerURL, a.Cfg.ServerURLs = clean[0], clean[1:]
+		a.epIdx = 0
+		for i, u := range a.Cfg.Endpoints() { // stay on the address that works now
+			if u == cur {
+				a.epIdx = i
+			}
+		}
+	}
+	a.epMu.Unlock()
+	if !same {
+		log.Printf("server address list updated: %v", clean)
+		if err := a.Cfg.Save(""); err != nil {
+			log.Printf("save config: %v", err)
+		}
+	}
+}
+
+// touch records successful contact; confirms a pending self-update and
+// keeps the watchdog copy current once this build has proven it can talk
+// to the server.
+func (a *Agent) touch() {
+	if time.Since(a.lastTouch) < time.Minute {
+		return
+	}
+	a.lastTouch = time.Now()
+	_ = os.WriteFile(filepath.Join(a.DataDir, "last_contact"), []byte(time.Now().UTC().Format(time.RFC3339)), 0o600)
+	marker := filepath.Join(a.DataDir, updateMarker)
+	if _, err := os.Stat(marker); err == nil {
+		_ = os.Remove(marker)
+		log.Printf("self-update to %s confirmed healthy", a.Version)
+	}
+	promoteWatchdog()
+}
+
 func (a *Agent) enroll(ctx context.Context) error {
 	req := protocol.EnrollRequest{Token: a.Cfg.EnrollToken, AgentVersion: a.Version, Variant: a.Variant, Facts: CollectFacts()}
 	var resp protocol.EnrollResponse
@@ -143,7 +229,7 @@ func (a *Agent) enroll(ctx context.Context) error {
 // Run blocks until ctx is cancelled or a self-update needs a restart.
 func (a *Agent) Run(ctx context.Context) error {
 	log.Printf("ai-rmm agent %s (%s) starting; server %s", a.Version, variantName(a.Variant), a.Cfg.ServerURL)
-	cleanupOldBinary()
+	cleanupOldBinary(a.DataDir)
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	backoff := time.Second
@@ -158,11 +244,12 @@ func (a *Agent) Run(ctx context.Context) error {
 		}
 	}
 
+	go a.mon.sender(ctx)
 	var lastFacts time.Time
 	backoff = time.Second
 	for ctx.Err() == nil {
 		a.flushSpool(ctx)
-		req := protocol.PollRequest{AgentVersion: a.Version, Variant: a.Variant, Running: a.runningIDs()}
+		req := protocol.PollRequest{AgentVersion: a.Version, Variant: a.Variant, Running: a.runningIDs(), MonitorVersion: a.mon.Version()}
 		if time.Since(lastFacts) > 15*time.Minute {
 			f := CollectFacts()
 			req.Facts = &f
@@ -183,8 +270,15 @@ func (a *Agent) Run(ctx context.Context) error {
 			continue
 		}
 		backoff = time.Second
+		a.touch()
 		if req.Facts != nil {
 			lastFacts = time.Now()
+		}
+		if len(resp.ServerURLs) > 0 {
+			a.setServerURLs(resp.ServerURLs)
+		}
+		if resp.Monitor != nil {
+			a.mon.Apply(ctx, resp.Monitor)
 		}
 		for i := range resp.Jobs {
 			a.start(ctx, resp.Jobs[i])

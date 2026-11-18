@@ -52,6 +52,22 @@ minimum, verify.
 
 ## Playbooks
 
+- **Session start:** `get_events` (last 24 h): offline agents, devices down, pending
+  approvals, schedule failures. Report anything new to the user before taking requests.
+- **Agent coverage:** `find_unmanaged_computers` on a DC, then `deploy_agent` with
+  `dry_run: true` on batches of 25 (production-floor PCs in their own batch with
+  `groups: ["ot", ...]`), then for real after the user agrees. Explain failures by stage:
+  `connect` = offline or SMB blocked, `authenticate` = credential problem,
+  `service_manager` = not admin.
+- **Patch management:** `patch_report`. For stale machines, run `windows_update_status`
+  with `search_missing: true`. Propose `save_schedule` windows per group: office PCs
+  overnight with `reboot_if_required`; servers and `ot` on agreed weekend windows,
+  without automatic reboot. Follow up with `patch_report`.
+- **Network:** `list_network_devices` with `state: down`, then `get_network_device`
+  (interfaces, history), then `test_connectivity` from a nearby agent. To add
+  coverage: `run_tool network_scan` (never on OT/PLC subnets without approval), then
+  `save_network_device` with the SNMP credential.
+
 - **User locked out:** `ad_locked_out_users` on a DC shows lockout source computers.
   Check that machine for stale credentials (mapped drives, services, scheduled tasks
   running as the user). Then `ad_unlock_user` on a DC.

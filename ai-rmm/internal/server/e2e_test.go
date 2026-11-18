@@ -6,11 +6,13 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -27,6 +29,7 @@ const fakePS = `#!/bin/sh
 echo "host noise before result"
 if grep -q '"fail":true' "$RMM_PARAMS_FILE"; then echo "boom" >&2; exit 1; fi
 if grep -q '"sleep":true' "$RMM_PARAMS_FILE"; then sleep 30; fi
+if grep -q '"echo_secret":true' "$RMM_PARAMS_FILE"; then echo "stdout leak: $(cat "$RMM_SECRETS_FILE")"; echo '<<<RMM-DATA>>>'; printf '{"leak":%s}\n' "$(cat "$RMM_SECRETS_FILE")"; exit 0; fi
 grep -q 'Get-RmmParam' "$RMM_SCRIPT_FILE" || { echo "prelude missing" >&2; exit 9; }
 echo '<<<RMM-DATA>>>'
 printf '{"tool":"%s","params":%s}\n' "$RMM_TOOL" "$(cat "$RMM_PARAMS_FILE")"
@@ -44,6 +47,10 @@ type env struct {
 }
 
 func setup(t *testing.T, mutateCfg func(*server.Config)) *env {
+	return setupFull(t, mutateCfg, nil)
+}
+
+func setupFull(t *testing.T, mutateCfg func(*server.Config), mutateAgent func(c *agent.Config, serverURL string)) *env {
 	if runtime.GOOS == "windows" {
 		t.Skip("uses a /bin/sh fake interpreter")
 	}
@@ -72,6 +79,9 @@ func setup(t *testing.T, mutateCfg func(*server.Config)) *env {
 	must(t, os.WriteFile(ps, []byte(fakePS), 0o755))
 	acfg := &agent.Config{ServerURL: hs.URL, EnrollToken: tok, PowerShellPath: ps}
 	acfg.ServerPubKey = b64(pub)
+	if mutateAgent != nil {
+		mutateAgent(acfg, hs.URL)
+	}
 	cfgPath := filepath.Join(adir, "agent.json")
 	must(t, acfg.Validate())
 	must(t, acfg.Save(cfgPath))
@@ -351,3 +361,91 @@ func must(t *testing.T, err error) {
 }
 
 func b64(b []byte) string { return base64.StdEncoding.EncodeToString(b) }
+
+func TestAgentFailsOverToSecondServerAddress(t *testing.T) {
+	// Primary address is dead; the agent must still enroll via the fallback.
+	e := setupFull(t, nil, func(c *agent.Config, url string) {
+		c.ServerURL = "http://127.0.0.1:1"
+		c.ServerURLs = []string{url}
+		c.InstallURL = "http://127.0.0.1:1"
+	})
+	if len(e.srv.ListAgents("", "", true)) != 1 {
+		t.Fatal("agent did not enroll through the fallback address")
+	}
+}
+
+func TestServerPushesAddressList(t *testing.T) {
+	var url string
+	e := setupFull(t, nil, func(c *agent.Config, u string) { url = u })
+	e.srv.Cfg.AgentServerURLs = []string{url, "https://rmm-backup.corp.local:8443"}
+	// Wake the long poll so the agent gets a fresh response.
+	var res server.SubmitResult
+	e.api(e.aiKey, "POST", "/api/v1/jobs?wait=10", map[string]interface{}{"tool": "system_info", "targets": []string{"all"}, "reason": "x"}, &res)
+	e.waitFor(func() bool {
+		c, err := agent.LoadConfig(e.agentCfg)
+		return err == nil && len(c.ServerURLs) == 1 && c.ServerURLs[0] == "https://rmm-backup.corp.local:8443" && c.InstallURL != ""
+	}, "pushed server URL list to be saved")
+}
+
+func TestSecretsReachScriptButAreRedacted(t *testing.T) {
+	e := setup(t, nil)
+	admin := server.Caller{Name: "test", Role: server.RoleAdmin}
+	must(t, e.srv.PutCredential(admin, "erp", server.CredGeneric, "", map[string]string{"apikey": "VERY-SECRET-KEY-42"}))
+	_, err := e.srv.SaveTool(admin, &server.Tool{Name: "leaky", Description: "tries to leak", Risk: protocol.RiskRead, Status: server.ToolPublished,
+		Params: json.RawMessage(`{"type":"object","properties":{"cred":{"type":"string"},"echo_secret":{"type":"boolean"}}}`), CredentialParams: []string{"cred"}, Script: "Get-RmmSecret 'cred.apikey'"})
+	must(t, err)
+	var res server.SubmitResult
+	e.api(e.aiKey, "POST", "/api/v1/jobs?wait=10", map[string]interface{}{"tool": "leaky", "targets": []string{"all"}, "reason": "x", "params": map[string]interface{}{"cred": "erp", "echo_secret": true}}, &res)
+	j := res.Jobs[0]
+	if j.Status != protocol.StatusSucceeded {
+		t.Fatalf("status %s %+v", j.Status, j.Result)
+	}
+	all := j.Result.Stdout + j.Result.Stderr + string(j.Result.Data)
+	if strings.Contains(all, "VERY-SECRET-KEY-42") {
+		t.Fatalf("secret leaked: %s", all)
+	}
+	if !strings.Contains(all, "[REDACTED]") || !strings.Contains(string(j.Result.Data), "cred.apikey") {
+		t.Fatalf("expected the script to have received (redacted) secrets: %s", all)
+	}
+}
+
+func TestNativeNetworkScan(t *testing.T) {
+	e := setup(t, nil)
+	_, port, _ := net.SplitHostPort(strings.TrimPrefix(e.http.URL, "http://"))
+	p, _ := strconv.Atoi(port)
+	var res server.SubmitResult
+	e.api(e.aiKey, "POST", "/api/v1/jobs?wait=20", map[string]interface{}{"tool": "network_scan", "targets": []string{"all"}, "reason": "discover",
+		"params": map[string]interface{}{"cidr": "127.0.0.1/32", "ports": []int{p}, "ping": false}}, &res)
+	j := res.Jobs[0]
+	if j.Status != protocol.StatusSucceeded {
+		t.Fatalf("scan: %s %+v", j.Status, j.Result)
+	}
+	var d struct {
+		Alive int `json:"alive"`
+		Hosts []struct {
+			IP        string `json:"ip"`
+			OpenPorts []int  `json:"open_ports"`
+		} `json:"hosts"`
+	}
+	must(t, json.Unmarshal(j.Result.Data, &d))
+	if d.Alive != 1 || d.Hosts[0].IP != "127.0.0.1" || len(d.Hosts[0].OpenPorts) != 1 || d.Hosts[0].OpenPorts[0] != p {
+		t.Fatalf("scan result %s", j.Result.Data)
+	}
+	var out map[string]string
+	if c := e.api(e.aiKey, "POST", "/api/v1/jobs", map[string]interface{}{"tool": "network_scan", "targets": []string{"all"}, "reason": "x", "params": map[string]interface{}{"cidr": "10.0.0.0/16"}}, &out); c != 400 {
+		t.Fatalf("oversized scan should be refused: %d %v", c, out)
+	}
+}
+
+func TestDeployFromNonWindowsSourceFailsCleanly(t *testing.T) {
+	e := setup(t, nil)
+	admin := server.Caller{Name: "test", Role: server.RoleAdmin}
+	must(t, e.srv.PutCredential(admin, "deploy", server.CredWindows, "", map[string]string{"username": "CORP\\svc", "password": "pw-secret-1"}))
+	var res server.SubmitResult
+	e.api(e.adminKey, "POST", "/api/v1/jobs?wait=10", map[string]interface{}{"tool": "deploy_agent", "targets": []string{"all"}, "reason": "x",
+		"params": map[string]interface{}{"computers": []string{"PC-01"}, "credential": "deploy"}}, &res)
+	j := res.Jobs[0]
+	if j.Status != protocol.StatusFailed || !strings.Contains(j.Result.Stderr, "Windows") {
+		t.Fatalf("expected clean failure: %s %+v", j.Status, j.Result)
+	}
+}

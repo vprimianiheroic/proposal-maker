@@ -25,7 +25,12 @@ Ground rules:
 - Prefer existing tools. If none fits, write a new one with save_tool: small, single-purpose, parameterised via Get-RmmParam, returning objects (not formatted text), with an honest risk level. New tools are drafts until an admin publishes them; draft runs always need approval.
 - Use run_powershell only for one-off investigation that no tool covers; it is always high risk.
 - Record durable knowledge about a machine (its role, quirks, owner) with set_agent_notes so future sessions benefit.
-- Targets can be agent IDs, hostnames, "group:<name>" or "all". Use "all" sparingly.`
+- Targets can be agent IDs, hostnames, "group:<name>" or "all". Use "all" sparingly.
+- Start a session with get_events (offline agents, devices down, pending approvals).
+- Expanding coverage: find_unmanaged_computers -> deploy_agent (dry_run first, batches of 25, right groups per batch).
+- Patching: patch_report -> windows_update_status(search_missing) where stale -> save_schedule for maintenance windows rather than ad-hoc installs.
+- Network: run_tool network_scan to discover, save_network_device to monitor, get_network_device for interface detail. Never scan production-control (OT/PLC) subnets without explicit approval.
+- Credentials are referenced by name (list_credentials); you never see or handle secrets.`
 
 type rpcReq struct {
 	JSONRPC string          `json:"jsonrpc"`
@@ -81,7 +86,7 @@ func (s *Server) handleMCP(w http.ResponseWriter, r *http.Request) {
 	case "ping":
 		resp.Result = map[string]interface{}{}
 	case "tools/list":
-		resp.Result = map[string]interface{}{"tools": mcpToolDefs()}
+		resp.Result = map[string]interface{}{"tools": append(mcpToolDefs(), mcpExtToolDefs()...)}
 	case "tools/call":
 		var p struct {
 			Name      string          `json:"name"`
@@ -142,7 +147,7 @@ func mcpToolDefs() []map[string]interface{} {
 		d("list_pending_approvals", "List jobs waiting for a human to approve, with the reason approval is required.", schema(``)),
 		d("cancel_job", "Cancel a queued or pending job.", schema(`"job_id":{"type":"string"}`, "job_id")),
 		d("save_tool", "Create or update a custom snap-in tool. It is saved as a DRAFT: runs need human approval until an admin publishes it. Script conventions: read inputs with Get-RmmParam 'name' 'default'; emit objects (they become JSON); throw on failure.",
-			schema(`"name":{"type":"string","description":"snake_case, e.g. check_label_printer"},"description":{"type":"string"},"risk":{"type":"string","enum":["read","change","high"]},"timeout_sec":{"type":"integer"},"params_schema":{"type":"object","description":"JSON Schema object describing parameters"},"script":{"type":"string"}`, "name", "description", "risk", "script")),
+			schema(`"name":{"type":"string","description":"snake_case, e.g. check_label_printer"},"description":{"type":"string"},"risk":{"type":"string","enum":["read","change","high"]},"timeout_sec":{"type":"integer"},"params_schema":{"type":"object","description":"JSON Schema object describing parameters"},"script":{"type":"string"},"credential_params":{"type":"array","items":{"type":"string"},"description":"Params whose value is a vault credential name; the script reads fields with Get-RmmSecret '<param>.<field>' (e.g. 'cred.password'). Secrets are redacted from output."}`, "name", "description", "risk", "script")),
 		d("set_agent_notes", "Replace the free-text notes on a machine (its role, owner, quirks). Use to remember things across sessions.",
 			schema(`"agent":{"type":"string"},"notes":{"type":"string"}`, "agent", "notes")),
 		d("get_audit_log", "Read the most recent audit log entries.", schema(`"limit":{"type":"integer"}`)),
@@ -172,6 +177,7 @@ func (s *Server) callMCPTool(r *http.Request, c Caller, name string, raw json.Ra
 		Description  string          `json:"description"`
 		Risk         protocol.Risk   `json:"risk"`
 		ParamsSchema json.RawMessage `json:"params_schema"`
+		CredParams   []string        `json:"credential_params"`
 		Notes        *string         `json:"notes"`
 	}
 	if err := json.Unmarshal(raw, &a); err != nil {
@@ -297,7 +303,7 @@ func (s *Server) callMCPTool(r *http.Request, c Caller, name string, raw json.Ra
 		return "cancelled", nil
 
 	case "save_tool":
-		t := &Tool{Name: a.Name, Description: a.Description, Risk: a.Risk, TimeoutSec: a.TimeoutSec, Params: a.ParamsSchema, Script: a.Script}
+		t := &Tool{Name: a.Name, Description: a.Description, Risk: a.Risk, TimeoutSec: a.TimeoutSec, Params: a.ParamsSchema, Script: a.Script, CredentialParams: a.CredParams}
 		saved, err := s.SaveTool(c, t)
 		if err != nil {
 			return "", err
@@ -329,6 +335,9 @@ func (s *Server) callMCPTool(r *http.Request, c Caller, name string, raw json.Ra
 			return "", err
 		}
 		return toText(lines)
+	}
+	if txt, handled, err := s.callMCPExt(r, c, name, raw); handled {
+		return txt, err
 	}
 	return "", fmt.Errorf("unknown tool %q", name)
 }

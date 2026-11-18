@@ -49,7 +49,7 @@ pre { white-space:pre-wrap; word-break:break-word; background:var(--bg); padding
 <main id="main"></main>
 </div>
 <script>
-const tabs = ["Approvals","Agents","Jobs","Tools","Enroll","Audit"];
+const tabs = ["Approvals","Events","Agents","Network","Schedules","Jobs","Tools","Credentials","Enroll","Audit"];
 let tab = "Approvals", key = sessionStorage.getItem("rmmkey") || "";
 const $ = s => document.querySelector(s);
 const esc = v => String(v ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
@@ -71,10 +71,10 @@ function start(w) {
   $("#who").textContent = w.name + " (" + w.role + ") · server " + w.server_version;
   $("#nav").innerHTML = tabs.map(t => `<button data-t="${t}">${t}</button>`).join("");
   $("#nav").onclick = e => { if (e.target.dataset.t) { tab = e.target.dataset.t; render(); } };
-  render(); setInterval(() => { if (tab==="Approvals"||tab==="Agents") render(); }, 10000);
+  render(); setInterval(() => { if (["Approvals","Agents","Network","Events"].includes(tab)) render(); }, 15000);
 }
 const statusClass = s => ({succeeded:"ok",queued:"muted",dispatched:"muted",pending_approval:"warn",failed:"bad",timeout:"bad",rejected:"bad",denied:"bad",expired:"muted"}[s]||"");
-async function render() {
+let render = async function() {
   document.querySelectorAll("#nav button").forEach(b => b.classList.toggle("on", b.dataset.t===tab));
   const m = $("#main");
   try { m.innerHTML = await views[tab](); } catch(e) { m.innerHTML = `<div class="card bad">${esc(e.message)}</div>`; }
@@ -82,7 +82,15 @@ async function render() {
 const views = {
   async Approvals() {
     const jobs = await api("approvals");
-    if (!jobs.length) return `<div class="card muted">Nothing is waiting for approval.</div>`;
+    const scheds = (await api("schedules")).filter(s => !s.approved);
+    const schedHtml = scheds.map(s => `<div class="card"><div class="row"><b>Schedule: ${esc(s.name)}</b><span class="pill warn">recurring</span>
+        <span class="muted">by ${esc(s.created_by)}</span></div>
+        <div><b>${esc(s.tool)}</b> on ${(s.targets||[]).map(t=>`<span class="pill">${esc(t)}</span>`).join("")} at ${esc(s.time)} ${(s.days||[]).length ? esc(s.days.join(",")) : "daily"} · window ${s.window_minutes} min</div>
+        <div><b>Reason:</b> ${esc(s.reason)}</div><pre>${esc(JSON.stringify(s.params,null,1))}</pre>
+        <div class="muted">Approving lets every future run of this exact schedule proceed without further approval.</div>
+        <div class="row" style="margin-top:8px"><button class="act primary" onclick="schedAct('${s.id}','approve')">Approve schedule</button>
+        <button class="act danger" onclick="schedDel('${s.id}')">Delete</button></div></div>`).join("");
+    if (!jobs.length) return schedHtml || `<div class="card muted">Nothing is waiting for approval.</div>`;
     const batches = {};
     jobs.forEach(j => (batches[j.batch_id] ||= []).push(j));
     return Object.entries(batches).map(([b, js]) => { const j = js[0]; return `
@@ -98,7 +106,52 @@ const views = {
           <button class="act primary" onclick="decide('${b}',true)">Approve all ${js.length}</button>
           <button class="act danger" onclick="decide('${b}',false)">Deny</button>
         </div>
-      </div>`; }).join("");
+      </div>`; }).join("") + schedHtml;
+  },
+  async Events() {
+    const ev = await api("events?limit=200");
+    const cls = {critical:"bad",warning:"warn",info:"ok"};
+    return `<div class="wrap"><table><tr><th>When</th><th>Type</th><th>Subject</th><th>Event</th></tr>` +
+      ev.map(e => `<tr><td>${ts(e.time)}</td><td class="${cls[e.severity]||""}">${esc(e.type)}</td><td>${esc(e.subject)}</td><td>${esc(e.text)}</td></tr>`).join("") + `</table></div>`;
+  },
+  async Network() {
+    const ds = await api("devices");
+    const cls = {up:"ok",down:"bad",stale:"warn",unknown:"muted"};
+    if (!ds.length) return `<div class="card muted">No network devices monitored yet. Ask the AI to run <code>network_scan</code> and add devices, or POST to /api/v1/devices.</div>`;
+    return `<div class="wrap"><table><tr><th>Device</th><th>State</th><th>Address</th><th>Kind</th><th>Latency</th><th>SNMP</th><th>Last check</th><th></th></tr>` +
+      ds.map(d => { const st = d.status||{}; const sn = st.snmp||{}; return `<tr>
+        <td><b>${esc(d.name)}</b><div class="muted">${esc(d.notes)}</div></td>
+        <td class="${cls[st.state]||""}">${esc(st.state)}<div class="muted">${esc(st.error)}</div></td>
+        <td>${esc(d.address)}</td><td>${esc(d.kind)}</td>
+        <td>${st.latency_ms ? st.latency_ms.toFixed(1)+" ms" : ""}</td>
+        <td>${sn.ok ? esc(sn.sys_name)+`<div class="muted">${esc((sn.sys_descr||"").slice(0,80))}</div>` : esc(sn.error||"")}</td>
+        <td>${ts(st.last_check)}</td>
+        <td><button class="act danger" onclick="devDel('${d.id}')">Remove</button></td></tr>`; }).join("") + `</table></div>`;
+  },
+  async Schedules() {
+    const ss = await api("schedules");
+    if (!ss.length) return `<div class="card muted">No schedules. The AI can propose them (e.g. weekly patch windows) with save_schedule; they appear under Approvals.</div>`;
+    return `<div class="wrap"><table><tr><th>Name</th><th>Tool / targets</th><th>When</th><th>Next run</th><th>State</th><th>Last run</th><th></th></tr>` +
+      ss.map(s => `<tr><td><b>${esc(s.name)}</b><div class="muted">${esc(s.reason)}</div></td>
+        <td>${esc(s.tool)}<div>${(s.targets||[]).map(t=>`<span class="pill">${esc(t)}</span>`).join("")}</div></td>
+        <td>${esc(s.time)} ${(s.days||[]).length ? esc(s.days.join(",")) : "daily"}<div class="muted">window ${s.window_minutes} min</div></td>
+        <td>${ts(s.next_run)}</td>
+        <td>${s.approved ? `<span class="ok">approved</span>` : `<span class="warn">needs approval</span>`} · ${s.enabled ? "enabled" : "paused"}</td>
+        <td>${ts(s.last_run)}</td>
+        <td>${s.approved ? "" : `<button class="act primary" onclick="schedAct('${s.id}','approve')">Approve</button>`}
+            <button class="act" onclick="schedAct('${s.id}','${s.enabled?"disable":"enable"}')">${s.enabled?"Pause":"Resume"}</button>
+            <button class="act danger" onclick="schedDel('${s.id}')">Delete</button></td></tr>`).join("") + `</table></div>`;
+  },
+  async Credentials() {
+    const cs = await api("credentials");
+    return `<div class="card"><h3>Credential vault</h3><p class="muted">Encrypted at rest. The AI can use these by name (deploy_agent, network_scan, SNMP monitoring) but can never read them.</p>
+      <div class="row"><input id="crName" placeholder="name (e.g. domain-deploy)"><select id="crKind" onchange="crFields()"><option>windows</option><option>snmp</option><option>generic</option></select>
+      <input id="crDesc" placeholder="description" style="flex:1"></div>
+      <div class="row" id="crFields"></div>
+      <button class="act primary" onclick="crSave()">Save credential</button></div>` +
+      `<div class="wrap"><table><tr><th>Name</th><th>Kind</th><th>Username</th><th>Description</th><th>Created</th><th></th></tr>` +
+      cs.map(c => `<tr><td><b>${esc(c.name)}</b></td><td>${esc(c.kind)}</td><td>${esc(c.username)}</td><td>${esc(c.description)}</td><td>${ts(c.created_at)}</td>
+        <td><button class="act danger" onclick="crDel('${esc(c.name)}')">Delete</button></td></tr>`).join("") + `</table></div>`;
   },
   async Agents() {
     const as = await api("agents");
@@ -174,6 +227,24 @@ async function mkToken() {
     const o = $("#etOut"); o.hidden = false; o.textContent = "Token (shown once): " + r.token;
   } catch(e) { alert(e.message); }
 }
+async function schedAct(id, a) { try { await api("schedules/"+id+"/"+a, {method:"POST"}); } catch(e) { alert(e.message); } render(); }
+async function schedDel(id) { if (!confirm("Delete this schedule?")) return; try { await api("schedules/"+id, {method:"DELETE"}); } catch(e) { alert(e.message); } render(); }
+async function devDel(id) { if (!confirm("Stop monitoring this device?")) return; try { await api("devices/"+id, {method:"DELETE"}); } catch(e) { alert(e.message); } render(); }
+async function crDel(n) { if (!confirm("Delete credential "+n+"? Tools and devices using it will fail.")) return; try { await api("credentials/"+n, {method:"DELETE"}); } catch(e) { alert(e.message); } render(); }
+const crSpec = { windows: ["username","password"], snmp: ["version","community","username","auth_proto","auth_pass","priv_proto","priv_pass"], generic: ["key1","value1"] };
+function crFields() {
+  const k = $("#crKind").value;
+  $("#crFields").innerHTML = crSpec[k].map(f => `<input data-f="${f}" placeholder="${f}${f==="version"?" (2c or 3)":""}" type="${/pass|community|value/.test(f)?"password":"text"}">`).join("");
+}
+async function crSave() {
+  const k = $("#crKind").value, sec = {};
+  document.querySelectorAll("#crFields input").forEach(i => { if (i.value) sec[i.dataset.f] = i.value; });
+  if (k === "generic" && sec.key1) { sec[sec.key1] = sec.value1 || ""; delete sec.key1; delete sec.value1; }
+  try { await api("credentials/"+encodeURIComponent($("#crName").value.trim()), {method:"PUT", body:JSON.stringify({kind:k, description:$("#crDesc").value, secrets:sec})}); render(); }
+  catch(e) { alert(e.message); }
+}
+const _render = render;
+render = async function() { await _render(); if (tab === "Credentials") crFields(); };
 (async () => { if (key) { try { start(await api("whoami")); return; } catch(e) {} } $("#login").hidden = false; })();
 </script>
 </body>

@@ -27,6 +27,9 @@ import (
 	"time"
 
 	"github.com/airmm/airmm/internal/server"
+
+	// Embedded timezone database so schedule timezones work on Windows hosts.
+	_ "time/tzdata"
 )
 
 var version = "dev"
@@ -94,6 +97,48 @@ func main() {
 		s := mustServer(*dir)
 		check(addRelease(s, *dir, *file, *ver, *arch, *variant, splitCSV(*groups)))
 		check(s.Flush())
+	case "credential":
+		// rmm-server credential set|list|delete ...
+		if len(args) == 0 {
+			fatal(fmt.Errorf("usage: rmm-server credential set|list|delete [flags]"))
+		}
+		sub := args[0]
+		fs2 := flag.NewFlagSet("credential "+sub, flag.ExitOnError)
+		dir2 := fs2.String("data", "./rmm-data", "data directory")
+		name := fs2.String("name", "", "credential name, e.g. domain-deploy")
+		kind := fs2.String("kind", "windows", "windows | snmp | generic")
+		user := fs2.String("username", "", "username (windows: DOMAIN\\user)")
+		desc := fs2.String("description", "", "what it is for")
+		_ = fs2.Parse(args[1:])
+		s := mustServer(*dir2)
+		switch sub {
+		case "list":
+			for _, c := range s.ListCredentials() {
+				fmt.Printf("%-24s %-8s %-30s %s\n", c.Name, c.Kind, c.Username, c.Description)
+			}
+		case "delete":
+			check(s.DeleteCredential(cli, *name))
+			check(s.Flush())
+		case "set":
+			fmt.Fprintln(os.Stderr, "Enter secrets as key=value lines, then Ctrl-D (Ctrl-Z Enter on Windows).")
+			fmt.Fprintln(os.Stderr, "  windows: password=...   snmp v2c: community=...   snmp v3: version=3 username=... auth_proto=SHA auth_pass=... priv_proto=AES priv_pass=...")
+			sec := map[string]string{}
+			if *user != "" {
+				sec["username"] = *user
+			}
+			b, _ := io.ReadAll(os.Stdin)
+			for _, line := range strings.Split(string(b), "\n") {
+				line = strings.TrimRight(line, "\r")
+				if i := strings.IndexByte(line, '='); i > 0 {
+					sec[strings.TrimSpace(line[:i])] = line[i+1:]
+				}
+			}
+			check(s.PutCredential(cli, *name, *kind, *desc, sec))
+			check(s.Flush())
+			fmt.Println("stored", *name)
+		default:
+			fatal(fmt.Errorf("unknown credential subcommand %q", sub))
+		}
 	case "version":
 		fmt.Println("rmm-server", version)
 	default:
@@ -110,6 +155,8 @@ func usage() {
   rmm-server apikey       --name NAME --role ai|admin
   rmm-server enroll-token --name NAME [--groups ot,plant1] [--ttl 168h] [--max-uses N]
   rmm-server release      --file rmm-agent.exe --version 1.2.0 --arch amd64 [--variant legacy] [--groups canary]
+  rmm-server credential   set --name domain-deploy --kind windows --username 'CORP\svc-rmm' < secrets.txt
+  rmm-server credential   list | delete --name NAME
 
 Stop the server before running apikey / enroll-token / release against the same
 data dir, or use the dashboard / REST API while it runs.

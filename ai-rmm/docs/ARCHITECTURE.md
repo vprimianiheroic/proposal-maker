@@ -94,14 +94,34 @@ example to SQLite.
 | `POST /mcp` | API key | MCP Streamable HTTP (JSON responses) |
 | `GET /` | — (key entered in page) | console |
 
+## Native tools, monitoring, scheduling
+
+- **Native tools** (`deploy_agent`, `network_scan`) are declared on the server
+  (`native.go`) and implemented in the agent (`internal/agent/*`). The server
+  can attach secrets at dispatch (`dispatchHooks`), and the signature covers them.
+- **Monitoring**: the server derives each agent's collector assignment from
+  `state.devices` and sends it in the poll response whenever its keyed hash
+  (`monitor_version`) changes. Agents run one loop per device and POST batched
+  `MonitorReport`s to `/api/v1/agent/monitor` every 15 s. The server keeps the
+  current status, 24 h of up/down samples, and raises events.
+- **Schedules**: `schedule.go`, evaluated every 15 s. Runs are submitted as
+  role `schedule` (pre-approved) only while the schedule is approved and the
+  tool version matches the one approved.
+- **Events**: `events.go`, a bounded list in state plus webhook fan-out.
+- **Watchdog/rollback**: `service_windows.go` (`Watchdog`, `installWatchdog`),
+  `update.go` (marker file), `agent.go` (`touch` confirms the update and promotes
+  the watchdog copy).
+
 ## Roadmap (not built yet)
 
-- Maintenance windows per group (auto-approve `change`/`high` only inside a window).
-- Scheduled and recurring jobs (patch Tuesday, nightly health sweeps) plus threshold
-  alerting (disk < 10%, service down) that wakes the AI.
+- **Remote desktop for support staff**: planned as an on-demand, consented
+  session. The agent would launch a viewer helper in the user's session and
+  relay it over the existing outbound HTTPS connection through the server,
+  so it needs no inbound ports (WebRTC or a TURN-style relay). It would be
+  audited like any job and gated by policy (`ot` machines require approval).
 - Two-person approval for `high` risk on `ot` / `domain-controllers`.
 - SSO (Entra ID / OIDC) for the console, and key management UI.
-- Remote-shell / file-transfer primitives (deliberately left out; tools cover the need
-  more safely).
-- Network-device management (switches, firewalls) via an on-prem "collector" agent
-  running SSH/SNMP tools. The same tool format works, with a different interpreter.
+- LAPS-aware deployment: read each machine's LAPS password on a DC instead of a shared deployment account.
+- WinRM push path for networks that block SMB but allow WinRM.
+- SSH/API tools for switch and firewall *configuration* (backup configs, port changes) using the same vault and approval model.
+- Metrics history beyond up/down (interface throughput graphs) and thresholds (disk < 10 %) as events.

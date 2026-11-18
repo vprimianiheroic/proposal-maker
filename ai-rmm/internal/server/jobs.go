@@ -20,6 +20,10 @@ type Caller struct {
 
 func (c Caller) String() string { return c.Role + ":" + c.Name }
 
+// preapproved callers skip approval: humans with admin keys, and schedules
+// (which a human approved as a whole).
+func (c Caller) preapproved() bool { return c.Role == RoleAdmin || c.Role == RoleSchedule }
+
 const AdHocTool = "adhoc_powershell"
 
 type SubmitRequest struct {
@@ -84,6 +88,7 @@ func (s *Server) SaveTool(c Caller, t *Tool) (*Tool, error) {
 		return nil, fmt.Errorf("%q is a built-in tool; choose a different name", t.Name)
 	}
 	t.Source = "custom"
+	t.Kind = "" // only built-ins can be native
 	t.Author = c.String()
 	t.UpdatedAt = now()
 	t.Version = 1
@@ -236,6 +241,27 @@ func (s *Server) Submit(c Caller, req SubmitRequest) (*SubmitResult, error) {
 			tool.TimeoutSec = req.Timeout
 		}
 	}
+	if len(tool.CredentialParams) > 0 {
+		var pm map[string]interface{}
+		_ = json.Unmarshal(req.Params, &pm)
+		s.store.mu.Lock()
+		for _, cp := range tool.CredentialParams {
+			name, _ := pm[cp].(string)
+			if name == "" {
+				continue
+			}
+			if _, err := s.credentialLocked(name, ""); err != nil {
+				s.store.mu.Unlock()
+				return nil, err
+			}
+		}
+		s.store.mu.Unlock()
+	}
+	if hook, ok := submitHooks[tool.Name]; ok {
+		if err := hook(s, req.Params); err != nil {
+			return nil, err
+		}
+	}
 	queueMin := req.QueueMin
 	if queueMin <= 0 {
 		queueMin = s.Cfg.DefaultQueueMin
@@ -257,11 +283,11 @@ func (s *Server) Submit(c Caller, req SubmitRequest) (*SubmitResult, error) {
 	for _, a := range agents {
 		pol, sources := s.Cfg.EffectivePolicy(a.Groups)
 		approval := ""
-		if adhoc && !pol.AllowAdHocScripts && c.Role != RoleAdmin {
+		if adhoc && !pol.AllowAdHocScripts && !c.preapproved() {
 			s.store.mu.Unlock()
 			return nil, fmt.Errorf("ad-hoc scripts are disabled by policy for %s (%s); write a tool instead", a.Hostname, strings.Join(sources, ","))
 		}
-		if c.Role != RoleAdmin {
+		if !c.preapproved() {
 			switch {
 			case tool.Status == ToolDraft:
 				approval = "tool '" + tool.Name + "' is an unpublished draft"
@@ -272,7 +298,7 @@ func (s *Server) Submit(c Caller, req SubmitRequest) (*SubmitResult, error) {
 		j := &JobRecord{
 			ID: newID("j"), BatchID: batch, AgentID: a.ID, Hostname: a.Hostname,
 			Tool: tool.Name, ToolVersion: tool.Version, Risk: tool.Risk, Params: req.Params,
-			Script: tool.Script, TimeoutSec: tool.TimeoutSec, Reason: req.Reason,
+			Kind: tool.Kind, Script: tool.Script, CredentialParams: tool.CredentialParams, TimeoutSec: tool.TimeoutSec, Reason: req.Reason,
 			RequestedBy: c.String(), ApprovalReason: approval, CreatedAt: t0,
 			QueueDeadline: t0 + int64(queueMin*60),
 		}
@@ -291,6 +317,15 @@ func (s *Server) Submit(c Caller, req SubmitRequest) (*SubmitResult, error) {
 	s.store.markDirty()
 	s.store.mu.Unlock()
 
+	pending := 0
+	for _, j := range res.Jobs {
+		if j.Status == protocol.StatusPendingApproval {
+			pending++
+		}
+	}
+	if pending > 0 {
+		s.emit("approval_needed", "info", batch, fmt.Sprintf("%s requests %s (%s risk) on %d machine(s): %s", c.String(), tool.Name, tool.Risk, pending, req.Reason), map[string]string{"batch_id": batch})
+	}
 	s.Audit(c.String(), "job.submit", map[string]interface{}{
 		"batch": batch, "tool": tool.Name, "risk": tool.Risk, "targets": req.Targets,
 		"agents": len(agents), "reason": req.Reason, "params": req.Params,
@@ -388,6 +423,12 @@ func (s *Server) takeJobs(agentID string, max int) []protocol.Job {
 	}
 	sort.Slice(queued, func(a, b int) bool { return queued[a].CreatedAt < queued[b].CreatedAt })
 	var out []protocol.Job
+	var failed []string
+	defer func() {
+		for _, id := range failed {
+			go s.closeDone(id)
+		}
+	}()
 	t0 := now()
 	for _, j := range queued {
 		if len(out) >= max {
@@ -397,13 +438,32 @@ func (s *Server) takeJobs(agentID string, max int) []protocol.Job {
 		j.DispatchedAt = t0
 		j.ExpiresAt = t0 + int64(j.TimeoutSec) + 300
 		pj := protocol.Job{
-			ID: j.ID, AgentID: j.AgentID, Tool: j.Tool, Script: j.Script, Params: j.Params,
+			ID: j.ID, AgentID: j.AgentID, Tool: j.Tool, Kind: j.Kind, Script: j.Script, Params: j.Params,
 			TimeoutSec: j.TimeoutSec, IssuedAt: t0, ExpiresAt: j.ExpiresAt,
+		}
+		hook, ok := dispatchHooks[j.Tool]
+		if !ok && len(j.CredentialParams) > 0 {
+			hook, ok = credentialParamHook, true
+		}
+		if ok {
+			sec, extra, err := hook(s, j)
+			if err != nil {
+				// Can't build the job (e.g. credential deleted): fail it now.
+				j.Status = protocol.StatusFailed
+				j.FinishedAt = t0
+				j.Result = &protocol.JobResult{JobID: j.ID, Status: protocol.StatusFailed, ExitCode: -1, Stderr: "server could not prepare job: " + err.Error()}
+				failed = append(failed, j.ID)
+				continue
+			}
+			pj.Secrets = sec
+			if extra != nil {
+				pj.Params = extra
+			}
 		}
 		pj.Sign(s.signKey)
 		out = append(out, pj)
 	}
-	if len(out) > 0 {
+	if len(out) > 0 || len(failed) > 0 {
 		s.store.markDirty()
 	}
 	return out

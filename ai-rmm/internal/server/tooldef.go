@@ -23,11 +23,17 @@ type Tool struct {
 	TimeoutSec  int             `json:"timeout_sec"`
 	Params      json.RawMessage `json:"params"` // JSON Schema (object)
 	Script      string          `json:"script"`
-	Source      string          `json:"source"` // builtin | custom
-	Status      string          `json:"status"` // published | draft
-	Version     int             `json:"version"`
-	Author      string          `json:"author,omitempty"`
-	UpdatedAt   int64           `json:"updated_at"`
+	Source      string          `json:"source"`         // builtin | custom
+	Status      string          `json:"status"`         // published | draft
+	Kind        string          `json:"kind,omitempty"` // "" = PowerShell, "native" = implemented inside the agent
+	// CredentialParams names string params whose values are vault credential
+	// names. At dispatch the credential's fields are delivered as secrets
+	// "<param>.<field>" (read with Get-RmmSecret); the agent redacts them
+	// from all output.
+	CredentialParams []string `json:"credential_params,omitempty"`
+	Version          int      `json:"version"`
+	Author           string   `json:"author,omitempty"`
+	UpdatedAt        int64    `json:"updated_at"`
 }
 
 const (
@@ -62,6 +68,11 @@ func (t *Tool) Validate() error {
 	}
 	if strings.TrimSpace(t.Script) == "" {
 		return errors.New("script is required")
+	}
+	for _, cp := range t.CredentialParams {
+		if !strings.Contains(string(t.Params), `"`+cp+`"`) {
+			return fmt.Errorf("credential_params: %q is not a declared parameter", cp)
+		}
 	}
 	if len(t.Script) > 256*1024 {
 		return errors.New("script too large (256KB max)")

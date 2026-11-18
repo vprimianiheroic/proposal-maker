@@ -21,3 +21,6 @@ func InstallService(cfg *Config, inPlace bool) error {
 	return errors.New("service install is only supported on Windows; use `rmm-agent run --config <file>`")
 }
 func UninstallService(purge bool) error { return errors.New("only supported on Windows") }
+
+func Watchdog() error     { return errors.New("only supported on Windows") }
+func RunBootstrap() error { return errors.New("only supported on Windows") }

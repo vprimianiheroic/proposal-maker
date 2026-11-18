@@ -23,9 +23,10 @@ type Server struct {
 	Cfg     *Config
 	Version string
 
-	signKey ed25519.PrivateKey
-	store   *store
-	builtin map[string]*Tool
+	signKey  ed25519.PrivateKey
+	vaultKey []byte
+	store    *store
+	builtin  map[string]*Tool
 
 	notifyMu sync.Mutex
 	notify   map[string]chan struct{} // agentID -> wake long-poll
@@ -44,6 +45,10 @@ func New(dir, version string) (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
+	vk, err := loadOrCreateVaultKey(dir)
+	if err != nil {
+		return nil, err
+	}
 	st, err := loadStore(dir, cfg.JobRetention)
 	if err != nil {
 		return nil, err
@@ -56,8 +61,11 @@ func New(dir, version string) (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
+	for name, t := range nativeTools() {
+		bt[name] = t
+	}
 	s := &Server{
-		Dir: dir, Cfg: cfg, Version: version, signKey: key, store: st, builtin: bt,
+		Dir: dir, Cfg: cfg, Version: version, signKey: key, vaultKey: vk, store: st, builtin: bt,
 		notify: map[string]chan struct{}{}, doneCh: map[string]chan struct{}{}, audit: af,
 	}
 	// Jobs that were mid-flight when the server stopped can't be trusted to
@@ -196,6 +204,9 @@ func (s *Server) background(ctx context.Context) {
 			}
 		case <-reap.C:
 			s.reap()
+			s.checkAgentsOffline()
+			s.checkDevicesStale()
+			s.runDueSchedules()
 		}
 	}
 }

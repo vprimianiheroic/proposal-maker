@@ -8,3 +8,5 @@ module github.com/airmm/airmm
 go 1.20
 
 require golang.org/x/sys v0.15.0
+
+require github.com/gosnmp/gosnmp v1.38.0

@@ -39,6 +39,9 @@ Save the output of `init` to your password manager. The keys are not shown again
 | `group_policies` | Per-group overrides. **They can only tighten** the default. Defaults: `ot`, `servers` and `domain-controllers` allow `read` only. |
 | `default_queue_min` | How long a job waits for an offline machine before it expires. |
 | `job_retention` | Finished jobs kept in `state.json`. The audit log is never pruned. |
+| `alert_webhooks` | URLs that receive a JSON POST for agent offline/online, device down/up, interface down, approval needed, schedule results. |
+| `agent_server_urls` | Ordered server addresses pushed to every agent for failover and migration (see section 4). |
+| `timezone` | IANA zone for schedules, e.g. `America/Chicago`. Default: the server's local time. |
 
 Agents that report as a DC or server are put into `domain-controllers` / `servers`
 automatically at enrollment.
@@ -106,7 +109,50 @@ MSIs are built on Windows by `scripts/build-msi.ps1` or by the `msi` CI job: x64
 arm64, x64-legacy and x86-legacy. A later MSI installed with no properties upgrades in
 place and keeps the machine's identity.
 
-### Option C: one-off
+### Option C: let the agent spread itself (push install)
+
+Once a few machines have the agent (a DC is ideal), the AI or an admin can
+push it to the rest of the domain without GPO:
+
+1. **Create a deployment account**, e.g. `CORP\svc-rmm-deploy`, that is a
+   local administrator on the target machines. Prefer a dedicated group (say
+   `RMM Deployers`) added to local Administrators through your existing
+   Restricted Groups / Group Policy Preferences policy, rather than Domain
+   Admins. Disable the account between rollouts if you like; deploys fail
+   cleanly with "account disabled".
+2. **Store it in the vault**: console → *Credentials* → kind `windows`, or:
+   ```bash
+   printf 'password=%s\n' "$PW" | rmm-server credential set --data /var/lib/rmm-server \
+       --name domain-deploy --kind windows --username 'CORP\svc-rmm-deploy'
+   ```
+   It is encrypted with `vault.key`. The AI can reference `domain-deploy` but can never read it.
+3. **Publish a bootstrap build** (`rmm-server release ... --arch 386 --variant legacy`).
+   This 32-bit legacy build runs on every supported Windows version, so it
+   is pushed to unknown machines. After enrolling, each agent cross-grades
+   itself to the ideal build for its OS (x64/ARM64, modern/legacy). With no
+   release published, the source agent pushes its own binary instead.
+4. **Ask the AI**: "find computers without the agent and deploy to them". It
+   runs `find_unmanaged_computers` (an AD query on a managed machine), then
+   `deploy_agent` with `dry_run` in batches of 25, grouped correctly (`ot`
+   machines in their own batch). Each batch is one approval card in the console.
+
+How it works on each target: the source machine authenticates to
+`\\target\ADMIN$` with the vault credential, copies the agent and a bootstrap
+config holding a **single-use enrollment token** (valid 3 hours) that the
+server minted for that computer only, then creates a one-shot `AIRMMSetup`
+service over the same SMB session. That service installs the agent normally
+(Program Files, `AIRMMAgent` service, watchdog), deletes the token file and
+exits. The setup service and files are then removed. Neither the password nor
+the token ever appears on a command line.
+
+**Requirements on targets:** TCP 445 reachable from the source machine and
+the *File and Printer Sharing (SMB-In)* firewall rule allowed. Windows client
+SKUs block this on the domain profile by default. If your workstations block
+inbound SMB, enable that one rule scoped to the source machine's IP (a
+one-time firewall GPO), or use Option A. `dry_run` reports exactly which
+stage failed per machine: connect, authenticate, service_manager, and so on.
+
+### Option D: one-off
 
 ```powershell
 .\rmm-agent-windows-amd64.exe install --server https://rmm.corp.local:8443 --token et_... --pubkey <key> --tls-pin <pin>
@@ -124,7 +170,31 @@ Uninstall: remove the MSI product, or run `Uninstall-AIRMMAgent.ps1 [-Purge]`, o
 `rmm-agent.exe uninstall --purge`. To retire a machine on the server side, disable it in
 the console.
 
-## 4. Upgrading agents
+## 4. Staying in contact
+
+Several layers keep an agent reachable:
+
+- **Service recovery**: the SCM restarts the service 5 s, 30 s and 2 min after any failure.
+- **Watchdog**: a SYSTEM scheduled task (`AIRMM Watchdog`, every 10 min) runs a
+  separate known-good copy of the agent (`rmm-watchdog.exe`). It:
+  - re-creates the service if it was deleted, and re-enables it if it was disabled
+  - starts it if it was stopped
+  - restarts it if it has had no server contact for an hour
+  - **rolls back** a self-update that hasn't reached the server within 15 minutes
+
+  The watchdog copy is refreshed only after a new build has talked to the server successfully.
+- **Address failover**: set `agent_server_urls` in `config.json`, e.g.
+  `["https://rmm.corp.local:8443", "https://10.0.0.25:8443"]`. Every agent
+  stores the list and fails over in order. It also keeps the address it was
+  installed with as a last resort. To move the server, keep `tls.crt`,
+  `tls.key` and `signing.key` (copy the data dir), add the new address to the
+  list, wait for agents to check in, then cut over.
+- **Alerts**: `alert_webhooks` in `config.json` receives `agent_offline`,
+  `device_down` and the other events (Slack incoming webhooks work as-is; for
+  Teams use a Workflows "post to channel when a webhook request is received"
+  flow).
+
+## 5. Upgrading agents
 
 Agents update themselves. Publish a build, and every matching agent (same arch and
 variant) downloads it on its next poll, checks the server's signature and the SHA-256,
@@ -139,9 +209,33 @@ systemctl start rmm-server
 
 `--groups canary` limits a release to those groups, so you can roll out in stages. Agents
 never update mid-job. To roll back, publish the older build again: the newest *published*
-release wins, whatever its version number.
+release wins, whatever its version number. A broken build that can't reach the server is
+rolled back automatically by the watchdog.
 
-## 5. Connect the AI
+Publish every flavour you use (amd64, 386, arm64, amd64-legacy, 386-legacy). An agent
+running a non-ideal build for its OS is moved to the ideal one when it is available.
+
+## 6. Network monitoring
+
+1. Store SNMP credentials in the vault (console → *Credentials*, kind `snmp`;
+   v2c `community`, or v3 `version=3`, `username`, `auth_proto` SHA/SHA256,
+   `auth_pass`, `priv_proto` AES/AES256, `priv_pass`). Read-only is all that's needed.
+2. Pick a collector per site/VLAN: any managed, always-on machine (a server)
+   that can reach the devices. Allow UDP 161 and ICMP from it.
+3. Have the AI discover and add devices: `network_scan` (for example
+   `10.10.0.0/24` with the SNMP credential), then `save_network_device` for the
+   switches, APs, firewalls and UPSs worth watching. Or add them in bulk by POSTing
+   to `/api/v1/devices`.
+
+Each device is checked every `interval_sec` (default 60 s) with ping, any TCP
+ports you list, and SNMP system info. The interface table (oper/admin state,
+speed, errors, octets) is walked every 5th check. Two consecutive failures
+mark a device `down`. Ports **with a description (ifAlias)** that go down
+raise `interface_down`; unlabelled access ports are ignored to avoid noise
+from PCs sleeping. Active scanning can upset fragile PLCs, so keep
+`network_scan` off production-control subnets.
+
+## 7. Connect the AI
 
 Create a key per AI deployment so the audit log tells them apart:
 

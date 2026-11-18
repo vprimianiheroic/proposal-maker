@@ -25,6 +25,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/v1/agent/enroll", s.handleEnroll)
 	mux.HandleFunc("/api/v1/agent/poll", s.agentAuth(s.handlePoll))
 	mux.HandleFunc("/api/v1/agent/result", s.agentAuth(s.handleResult))
+	mux.HandleFunc("/api/v1/agent/monitor", s.agentAuth(s.handleMonitor))
 	mux.HandleFunc("/api/v1/agent/release/", s.agentAuth(s.handleRelease))
 	mux.HandleFunc("/api/v1/", s.apiAuth(s.handleAPI))
 	mux.HandleFunc("/mcp", s.apiAuth(s.handleMCP))
@@ -194,22 +195,30 @@ func (s *Server) handlePoll(w http.ResponseWriter, r *http.Request) {
 			a.Hostname = strings.ToUpper(req.Facts.Hostname)
 		}
 	}
-	upd := s.updateForLocked(a)
 	s.store.markDirty()
 	s.store.mu.Unlock()
 
-	resp := protocol.PollResponse{Update: upd}
 	ch := s.agentChan(id)
-	// Drain any stale wake-up so we only block if there is nothing queued.
+	// Drain any stale wake-up; we re-check everything below anyway.
 	select {
 	case <-ch:
 	default:
 	}
-	resp.Jobs = s.takeJobs(id, 8)
-	if len(resp.Jobs) == 0 && upd == nil {
+	build := func() protocol.PollResponse {
+		s.store.mu.Lock()
+		resp := protocol.PollResponse{Update: s.updateForLocked(s.store.st.Agents[id]), ServerURLs: s.Cfg.AgentServerURLs}
+		if mc := s.monitorConfigLocked(id); mc.Version != req.MonitorVersion && !(len(mc.Devices) == 0 && req.MonitorVersion == "") {
+			resp.Monitor = mc
+		}
+		s.store.mu.Unlock()
+		resp.Jobs = s.takeJobs(id, 8)
+		return resp
+	}
+	resp := build()
+	if len(resp.Jobs) == 0 && resp.Update == nil && resp.Monitor == nil {
 		select {
 		case <-ch:
-			resp.Jobs = s.takeJobs(id, 8)
+			resp = build()
 		case <-time.After(25 * time.Second):
 		case <-r.Context().Done():
 			// The agent hung up; any job we might take now would be lost.
@@ -217,6 +226,20 @@ func (s *Server) handlePoll(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	writeJSON(w, 200, resp)
+}
+
+func (s *Server) handleMonitor(w http.ResponseWriter, r *http.Request) {
+	id := r.Context().Value(ctxAgent).(string)
+	var reports []protocol.MonitorReport
+	if err := readJSON(r, &reports); err != nil {
+		writeErr(w, 400, err)
+		return
+	}
+	if len(reports) > 5000 {
+		reports = reports[:5000]
+	}
+	s.ingestMonitor(id, reports)
+	writeJSON(w, 200, map[string]bool{"ok": true})
 }
 
 func (s *Server) handleResult(w http.ResponseWriter, r *http.Request) {
@@ -236,23 +259,54 @@ func (s *Server) handleResult(w http.ResponseWriter, r *http.Request) {
 // updateForLocked returns the release assigned to this agent, if it differs
 // from what the agent runs.
 func (s *Server) updateForLocked(a *Agent) *protocol.UpdateInfo {
-	osName, arch := "windows", a.Facts.Arch
-	var best *Release
-	for _, rel := range s.store.st.Releases {
-		if rel.OS != osName || rel.Arch != arch || rel.Variant != a.Variant {
-			continue
+	pick := func(arch, variant string) *Release {
+		var best *Release
+		for _, rel := range s.store.st.Releases {
+			if rel.OS != "windows" || rel.Arch != arch || rel.Variant != variant {
+				continue
+			}
+			if len(rel.Groups) > 0 && !intersects(rel.Groups, a.Groups) {
+				continue
+			}
+			if best == nil || rel.CreatedAt > best.CreatedAt {
+				best = rel
+			}
 		}
-		if len(rel.Groups) > 0 && !intersects(rel.Groups, a.Groups) {
-			continue
-		}
-		if best == nil || rel.CreatedAt > best.CreatedAt {
-			best = rel
-		}
+		return best
 	}
-	if best == nil || best.Version == a.Version {
+	// Prefer the ideal build for this OS (cross-grade a pushed 32-bit
+	// bootstrap agent to x64, a legacy build on Windows 10 to modern...),
+	// otherwise the newest build of what it already runs.
+	idealArch, idealVariant := idealBuild(a.Facts)
+	best := pick(idealArch, idealVariant)
+	if best == nil {
+		best = pick(a.Facts.Arch, a.Variant)
+	}
+	if best == nil || (best.Version == a.Version && best.Arch == a.Facts.Arch && best.Variant == a.Variant) {
 		return nil
 	}
-	return &protocol.UpdateInfo{Version: best.Version, URL: "/api/v1/agent/release/" + best.File, SHA256: best.SHA256, Signature: best.Signature}
+	return &protocol.UpdateInfo{Version: best.Version, Arch: best.Arch, Variant: best.Variant, URL: "/api/v1/agent/release/" + best.File, SHA256: best.SHA256, Signature: best.Signature}
+}
+
+// idealBuild maps an OS to the build that should run on it.
+func idealBuild(f protocol.Facts) (arch, variant string) {
+	arch = f.OSArch
+	if arch == "" {
+		arch = f.Arch
+	}
+	major := 10
+	if i := strings.IndexByte(f.OSVersion, '.'); i > 0 {
+		if n, err := strconv.Atoi(f.OSVersion[:i]); err == nil {
+			major = n
+		}
+	}
+	if major < 10 {
+		variant = "legacy"
+		if arch == "arm64" {
+			arch = "386"
+		}
+	}
+	return arch, variant
 }
 
 func intersects(a, b []string) bool {
@@ -631,6 +685,102 @@ func (s *Server) handleAPI(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		writeJSON(w, 200, map[string]interface{}{"token": secret, "info": t})
+
+	case route == "credentials" && m == "GET":
+		writeJSON(w, 200, s.ListCredentials())
+	case route == "credentials" && arg != "" && m == "PUT":
+		var body struct {
+			Kind        string            `json:"kind"`
+			Description string            `json:"description"`
+			Secrets     map[string]string `json:"secrets"`
+		}
+		if err := readJSON(r, &body); err != nil {
+			writeErr(w, 400, err)
+			return
+		}
+		if body.Secrets == nil {
+			body.Secrets = map[string]string{}
+		}
+		if err := s.PutCredential(c, arg, body.Kind, body.Description, body.Secrets); err != nil {
+			writeErr(w, 400, err)
+			return
+		}
+		writeJSON(w, 200, map[string]bool{"ok": true})
+	case route == "credentials" && arg != "" && m == "DELETE":
+		if err := s.DeleteCredential(c, arg); err != nil {
+			writeErr(w, 400, err)
+			return
+		}
+		writeJSON(w, 200, map[string]bool{"ok": true})
+
+	case route == "devices" && arg == "" && m == "GET":
+		writeJSON(w, 200, s.ListDevices(q.Get("state")))
+	case route == "devices" && arg != "" && m == "GET":
+		d, err := s.GetDevice(arg)
+		if err != nil {
+			writeErr(w, 404, err)
+			return
+		}
+		writeJSON(w, 200, d)
+	case route == "devices" && (m == "POST" || m == "PUT"):
+		var d NetDevice
+		if err := readJSON(r, &d); err != nil {
+			writeErr(w, 400, err)
+			return
+		}
+		d.ID = arg
+		saved, err := s.SaveDevice(c, &d)
+		if err != nil {
+			writeErr(w, 400, err)
+			return
+		}
+		writeJSON(w, 200, saved)
+	case route == "devices" && arg != "" && m == "DELETE":
+		if err := s.DeleteDevice(c, arg); err != nil {
+			writeErr(w, 400, err)
+			return
+		}
+		writeJSON(w, 200, map[string]bool{"ok": true})
+
+	case route == "schedules" && arg == "" && m == "GET":
+		writeJSON(w, 200, s.ListSchedules())
+	case route == "schedules" && sub == "" && (m == "POST" || m == "PUT"):
+		var sc Schedule
+		if err := readJSON(r, &sc); err != nil {
+			writeErr(w, 400, err)
+			return
+		}
+		sc.ID = arg
+		saved, err := s.SaveSchedule(c, &sc)
+		if err != nil {
+			writeErr(w, 400, err)
+			return
+		}
+		writeJSON(w, 200, saved)
+	case route == "schedules" && arg != "" && m == "POST" && (sub == "approve" || sub == "enable" || sub == "disable"):
+		var err error
+		switch sub {
+		case "approve":
+			err = s.ApproveSchedule(c, arg)
+		default:
+			err = s.SetScheduleEnabled(c, arg, sub == "enable")
+		}
+		if err != nil {
+			writeErr(w, 400, err)
+			return
+		}
+		writeJSON(w, 200, map[string]bool{"ok": true})
+	case route == "schedules" && arg != "" && m == "DELETE":
+		if err := s.DeleteSchedule(c, arg); err != nil {
+			writeErr(w, 400, err)
+			return
+		}
+		writeJSON(w, 200, map[string]bool{"ok": true})
+
+	case route == "events" && m == "GET":
+		since, _ := strconv.ParseInt(q.Get("since"), 10, 64)
+		lim, _ := strconv.Atoi(q.Get("limit"))
+		writeJSON(w, 200, s.ListEvents(since, q.Get("type"), lim))
 
 	default:
 		writeErr(w, 404, errors.New("no such endpoint"))

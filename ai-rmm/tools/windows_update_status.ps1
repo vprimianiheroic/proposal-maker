@@ -1,7 +1,7 @@
 <#RMM-TOOL
 {
   "name": "windows_update_status",
-  "description": "Recently installed hotfixes, last update install time, WSUS/policy configuration, and (optionally) a live search for missing updates via the Windows Update Agent. The live search can take minutes.",
+  "description": "Recently installed hotfixes, pending reboot, WSUS/policy configuration, and (optionally) a live search for missing updates via the Windows Update Agent (can take minutes). Feeds patch_report; schedule it nightly with search_missing=true.",
   "risk": "read",
   "timeout_sec": 900,
   "params": { "type": "object", "properties": {
@@ -15,8 +15,11 @@ $hot = Get-WmiObject Win32_QuickFixEngineering | ForEach-Object {
 } | Sort-Object installed -Descending
 $wu = Get-ItemProperty 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate' -ErrorAction SilentlyContinue
 $au = Get-ItemProperty 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU' -ErrorAction SilentlyContinue
+$pending = (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending') -or
+           (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired')
+$searched = [bool](Get-RmmParam 'search_missing' $false)
 $missing = $null
-if (Get-RmmParam 'search_missing' $false) {
+if ($searched) {
   $s = (New-Object -ComObject Microsoft.Update.Session).CreateUpdateSearcher()
   $r = $s.Search("IsInstalled=0 and IsHidden=0 and Type='Software'")
   $missing = foreach ($u in $r.Updates) {
@@ -30,5 +33,7 @@ if (Get-RmmParam 'search_missing' $false) {
   target_group = $wu.TargetGroup
   au_options = $au.AUOptions
   no_auto_update = $au.NoAutoUpdate
-  missing_updates = $missing
+  pending_reboot = $pending
+  searched_missing = $searched
+  missing_updates = @($missing | Where-Object { $_ })
 }

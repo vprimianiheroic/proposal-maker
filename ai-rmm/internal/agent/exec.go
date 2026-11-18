@@ -32,6 +32,19 @@ function Get-RmmParam {
   if ($null -eq $p -or $null -eq $p.Value) { return $Default }
   return $p.Value
 }
+function Get-RmmSecret {
+  param([string]$Name)
+  if (-not $global:__rmmSecrets) {
+    $global:__rmmSecrets = New-Object PSObject
+    if ($env:RMM_SECRETS_FILE -and (Test-Path -LiteralPath $env:RMM_SECRETS_FILE)) {
+      $global:__rmmSecrets = ConvertFrom-Json ([System.IO.File]::ReadAllText($env:RMM_SECRETS_FILE))
+      Remove-Item -LiteralPath $env:RMM_SECRETS_FILE -Force -ErrorAction SilentlyContinue
+    }
+  }
+  $p = $global:__rmmSecrets.PSObject.Properties[$Name]
+  if ($null -eq $p) { throw "secret '$Name' was not provided to this job" }
+  return $p.Value
+}
 function Invoke-RmmNative {
   param([string]$FilePath, [string[]]$ArgumentList = @())
   $ErrorActionPreference = 'Continue'
@@ -61,6 +74,36 @@ const bootstrap = `& ([scriptblock]::Create([System.IO.File]::ReadAllText($env:R
 const maxOutput = 1 << 20
 
 func (a *Agent) execute(ctx context.Context, job *protocol.Job) *protocol.JobResult {
+	res := a.executeRaw(ctx, job)
+	redactResult(res, job.Secrets)
+	return res
+}
+
+// redactResult scrubs every delivered secret value from the result, so a
+// careless (or malicious) tool cannot echo a password back to the server
+// and the AI.
+func redactResult(res *protocol.JobResult, secrets map[string]string) {
+	for _, v := range secrets {
+		if len(v) < 4 {
+			continue
+		}
+		res.Stdout = strings.Replace(res.Stdout, v, "[REDACTED]", -1)
+		res.Stderr = strings.Replace(res.Stderr, v, "[REDACTED]", -1)
+		if len(res.Data) > 0 {
+			enc, _ := json.Marshal(v) // match the JSON-escaped form too
+			d := strings.Replace(string(res.Data), v, "[REDACTED]", -1)
+			d = strings.Replace(d, string(enc[1:len(enc)-1]), "[REDACTED]", -1)
+			if json.Valid([]byte(d)) {
+				res.Data = json.RawMessage(d)
+			} else {
+				res.Data = nil
+				res.Stderr += "\n[agent: structured output dropped: it contained a secret]"
+			}
+		}
+	}
+}
+
+func (a *Agent) executeRaw(ctx context.Context, job *protocol.Job) *protocol.JobResult {
 	res := &protocol.JobResult{JobID: job.ID, StartedAt: time.Now().Unix()}
 	finish := func(status string, code int, stderr string) *protocol.JobResult {
 		res.Status, res.ExitCode, res.FinishedAt = status, code, time.Now().Unix()
@@ -71,6 +114,13 @@ func (a *Agent) execute(ctx context.Context, job *protocol.Job) *protocol.JobRes
 	}
 	if err := job.Verify(a.pub, a.Cfg.AgentID, time.Now()); err != nil {
 		return finish(protocol.StatusRejected, -1, "agent refused job: "+err.Error())
+	}
+
+	if job.Kind == "native" {
+		return a.runNative(ctx, job, res)
+	}
+	if job.Kind != "" {
+		return finish(protocol.StatusRejected, -1, "unknown job kind "+job.Kind)
 	}
 
 	work := filepath.Join(a.DataDir, "work", job.ID)
@@ -91,6 +141,16 @@ func (a *Agent) execute(ctx context.Context, job *protocol.Job) *protocol.JobRes
 	if err := os.WriteFile(scriptFile, []byte(script), 0o600); err != nil {
 		return finish(protocol.StatusFailed, -1, err.Error())
 	}
+	secretsFile := ""
+	if len(job.Secrets) > 0 {
+		// Read once (and deleted) by Get-RmmSecret; never put in env vars or
+		// command lines, which other local processes can inspect.
+		secretsFile = filepath.Join(work, "secrets.json")
+		b, _ := json.Marshal(job.Secrets)
+		if err := os.WriteFile(secretsFile, b, 0o600); err != nil {
+			return finish(protocol.StatusFailed, -1, err.Error())
+		}
+	}
 
 	ps := a.powershell()
 	tctx, cancel := context.WithTimeout(ctx, time.Duration(job.TimeoutSec)*time.Second)
@@ -99,7 +159,7 @@ func (a *Agent) execute(ctx context.Context, job *protocol.Job) *protocol.JobRes
 	cmd.Dir = work
 	cmd.Env = append(os.Environ(),
 		"RMM_PARAMS_FILE="+paramsFile, "RMM_SCRIPT_FILE="+scriptFile,
-		"RMM_JOB_ID="+job.ID, "RMM_TOOL="+job.Tool)
+		"RMM_JOB_ID="+job.ID, "RMM_TOOL="+job.Tool, "RMM_SECRETS_FILE="+secretsFile)
 	var stdout, stderr capBuffer
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
 	setProcAttrs(cmd)

@@ -25,6 +25,13 @@ var (
 )
 
 func main() {
+	if agent.IsService() && len(os.Args) > 1 && os.Args[1] == "bootstrap" {
+		// One-shot setup service created by deploy_agent on a new machine.
+		if err := agent.RunBootstrap(); err != nil {
+			os.Exit(1)
+		}
+		return
+	}
 	if agent.IsService() {
 		setupFileLog()
 		err := agent.RunService(func(ctx context.Context) bool { return runAgent(ctx, agent.DefaultConfigPath()) })
@@ -98,6 +105,11 @@ func main() {
 			fatal(err)
 		}
 		fmt.Println("AI-RMM agent removed.")
+	case "watchdog":
+		// Run every 10 minutes by the "AIRMM Watchdog" scheduled task.
+		if err := agent.Watchdog(); err != nil {
+			fatal(err)
+		}
 	case "facts":
 		f := agent.CollectFacts()
 		fmt.Printf("%+v\n", f)
@@ -140,6 +152,7 @@ func usage() {
                       write config only (used by the MSI)
   rmm-agent uninstall [--purge]
   rmm-agent run       [--config FILE]   run in the foreground (debugging)
+  rmm-agent watchdog                   ensure the service exists/runs; roll back a bad update (scheduled task)
   rmm-agent facts                      print the inventory facts this machine reports
   rmm-agent version
 `)

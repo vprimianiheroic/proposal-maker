@@ -48,6 +48,10 @@ try { $c.Connect($hostAddr, $port); $open = $true } catch { } finally { $c.Close
   WMI objects are huge.
 - **Failure**: `throw`. `$ErrorActionPreference` is `Stop`, so any uncaught error fails
   the job and its message goes to `stderr`.
+- **Secrets**: never take passwords as parameters. Declare a credential parameter
+  in the header (`"credential_params": ["cred"]` with a `cred` string property),
+  call the tool with the vault credential's *name*, and read fields with
+  `Get-RmmSecret 'cred.password'`. The agent redacts secret values from all output.
 - **Native commands**: use `Invoke-RmmNative 'exe' 'arg1','arg2'`. It returns
   `exit_code`, `lines` and `output`, and does not trip `Stop` on stderr noise.
 - **Compatibility**: target Windows PowerShell 5.1. Prefer `Get-WmiObject` and .NET
