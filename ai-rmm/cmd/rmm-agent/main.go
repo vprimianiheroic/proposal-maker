@@ -50,7 +50,11 @@ func main() {
 	case "run":
 		fs := flag.NewFlagSet("run", flag.ExitOnError)
 		cfgPath := fs.String("config", agent.DefaultConfigPath(), "config file")
+		logPath := fs.String("log", "", "also write the log to this file (size-capped)")
 		_ = fs.Parse(args)
+		if *logPath != "" {
+			log.SetOutput(io.MultiWriter(os.Stderr, &rotatingFile{path: *logPath}))
+		}
 		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 		defer stop()
 		if runAgent(ctx, *cfgPath) {
@@ -152,7 +156,7 @@ func usage() {
   rmm-agent configure --server URL --token TOKEN --pubkey KEY [--tls-pin HEX] [--config FILE]
                       write config only (used by the MSI)
   rmm-agent uninstall [--purge]
-  rmm-agent run       [--config FILE]   run in the foreground (debugging)
+  rmm-agent run       [--config FILE] [--log FILE]   run in the foreground (debugging; no self-update)
   rmm-agent watchdog                   ensure the service exists/runs; roll back a bad update (scheduled task)
   rmm-agent facts                      print the inventory facts this machine reports
   rmm-agent version

@@ -123,7 +123,12 @@ func (a *Agent) do(ctx context.Context, method, path string, body, out interface
 		}
 		return err
 	}
-	defer resp.Body.Close()
+	// Always drain the body so the TLS connection is reused; otherwise each
+	// poll opens a new connection and a busy host can run out of ports.
+	defer func() {
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))
+		resp.Body.Close()
+	}()
 	if resp.StatusCode != 200 {
 		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		return &httpError{resp.StatusCode, strings.TrimSpace(string(msg))}
@@ -254,7 +259,10 @@ func (a *Agent) Run(ctx context.Context) error {
 	backoff = time.Second
 	for ctx.Err() == nil {
 		a.flushSpool(ctx)
-		req := protocol.PollRequest{AgentVersion: a.Version, Variant: a.Variant, Running: a.runningIDs(), MonitorVersion: a.mon.Version()}
+		running := a.runningIDs()
+		req := protocol.PollRequest{AgentVersion: a.Version, Variant: a.Variant, Running: running, MonitorVersion: a.mon.Version(),
+			DeferUpdate: !a.SelfUpdate || len(running) > 0}
+		pollStart := time.Now()
 		if time.Since(lastFacts) > 15*time.Minute {
 			f := CollectFacts()
 			req.Facts = &f
@@ -284,6 +292,11 @@ func (a *Agent) Run(ctx context.Context) error {
 		}
 		if resp.Monitor != nil {
 			a.mon.Apply(ctx, resp.Monitor)
+		}
+		if len(resp.Jobs) == 0 && resp.Monitor == nil && time.Since(pollStart) < time.Second {
+			// Server answered instantly with nothing to do (e.g. an update
+			// we are deferring): don't spin.
+			sleepCtx(ctx, 2*time.Second)
 		}
 		for i := range resp.Jobs {
 			a.start(ctx, resp.Jobs[i])

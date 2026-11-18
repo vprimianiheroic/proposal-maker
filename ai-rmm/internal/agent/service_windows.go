@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 	"unicode/utf16"
 
@@ -467,8 +468,25 @@ func UninstallService(purge bool) error {
 	}
 	if purge {
 		_ = os.RemoveAll(DefaultDataDir())
-		// The binary may be the one running this command; schedule removal.
-		_ = exec.Command("cmd.exe", "/c", "ping -n 3 127.0.0.1 >nul & rmdir /s /q \""+InstallDir()+"\"").Start()
+		dir := InstallDir()
+		self, _ := os.Executable()
+		// Delete everything we can now; the running binary (if it lives
+		// there) can only go once this process exits, so a detached cmd
+		// retries the folder removal for up to ~30 seconds.
+		if ents, err := os.ReadDir(dir); err == nil {
+			for _, e := range ents {
+				p := filepath.Join(dir, e.Name())
+				if !strings.EqualFold(p, self) {
+					_ = os.RemoveAll(p)
+				}
+			}
+		}
+		script := `for /l %i in (1,1,15) do (if exist "` + dir + `" (rmdir /s /q "` + dir + `" 2>nul & ping -n 3 127.0.0.1 >nul))`
+		// Raw command line: Go's argument escaping (\") is not understood by cmd.exe.
+		c := exec.Command(filepath.Join(os.Getenv("SystemRoot"), "System32", "cmd.exe"))
+		c.SysProcAttr = &syscall.SysProcAttr{HideWindow: true, CmdLine: `cmd.exe /d /c ` + script,
+			CreationFlags: createNoWindow | 0x00000008 /* DETACHED_PROCESS */}
+		_ = c.Start()
 	}
 	return nil
 }

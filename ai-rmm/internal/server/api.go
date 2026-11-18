@@ -206,7 +206,10 @@ func (s *Server) handlePoll(w http.ResponseWriter, r *http.Request) {
 	}
 	build := func() protocol.PollResponse {
 		s.store.mu.Lock()
-		resp := protocol.PollResponse{Update: s.updateForLocked(s.store.st.Agents[id]), ServerURLs: s.Cfg.AgentServerURLs}
+		resp := protocol.PollResponse{ServerURLs: s.Cfg.AgentServerURLs}
+		if !req.DeferUpdate {
+			resp.Update = s.updateForLocked(s.store.st.Agents[id])
+		}
 		if mc := s.monitorConfigLocked(id); mc.Version != req.MonitorVersion && !(len(mc.Devices) == 0 && req.MonitorVersion == "") {
 			resp.Monitor = mc
 		}

@@ -168,11 +168,15 @@ type EnrollResponse struct {
 }
 
 type PollRequest struct {
-	AgentVersion   string   `json:"agent_version"`
-	Variant        string   `json:"variant"`
-	MonitorVersion string   `json:"monitor_version,omitempty"`
-	Facts          *Facts   `json:"facts,omitempty"` // sent on start and periodically
-	Running        []string `json:"running,omitempty"`
+	AgentVersion   string `json:"agent_version"`
+	Variant        string `json:"variant"`
+	MonitorVersion string `json:"monitor_version,omitempty"`
+	// DeferUpdate tells the server not to offer a build now (agent is busy
+	// or running in the foreground), so the poll can long-poll normally
+	// instead of returning immediately every time.
+	DeferUpdate bool     `json:"defer_update,omitempty"`
+	Facts       *Facts   `json:"facts,omitempty"` // sent on start and periodically
+	Running     []string `json:"running,omitempty"`
 }
 
 type PollResponse struct {

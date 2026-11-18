@@ -26,6 +26,26 @@ $script:procs = @()
 
 function Log([string]$m) { Write-Host ("[{0}] {1}" -f (Get-Date -Format 'HH:mm:ss'), $m) }
 
+# Reads a file even while another process has it open for writing.
+function Read-Shared([string]$Path, [int]$Tail = 25) {
+  try {
+    $fs = [IO.File]::Open($Path, 'Open', 'Read', 'ReadWrite,Delete')
+    try { $sr = New-Object IO.StreamReader($fs); $lines = $sr.ReadToEnd() -split "`r?`n" } finally { $fs.Close() }
+    ($lines | Where-Object { $_ } | Select-Object -Last $Tail) -join "`n"
+  } catch {
+    $acl = try { (Get-Acl $Path).AccessToString } catch { '?' }
+    "<unreadable: $($_.Exception.Message); ACL: $acl>"
+  }
+}
+
+function Dump-AgentLogs([string]$Why) {
+  foreach ($f in "$PD\agent.log", "$PD\watchdog.log", "$WorkDir\source-agent.log") {
+    if (Test-Path $f) { Write-Host "----- $f ($Why)"; Write-Host (Read-Shared $f 30) }
+  }
+  $svc = Get-Service AIRMMAgent -ErrorAction SilentlyContinue
+  Write-Host "----- AIRMMAgent service: $(if ($svc) { "$($svc.Status) / $($svc.StartType)" } else { 'absent' })"
+}
+
 function Step([string]$Name, [scriptblock]$Body) {
   Log "=== $Name"
   $sw = [Diagnostics.Stopwatch]::StartNew()
@@ -38,6 +58,7 @@ function Step([string]$Name, [scriptblock]$Body) {
     $results.Add([pscustomobject]@{ Step = $Name; Result = 'FAIL'; Seconds = [math]::Round($sw.Elapsed.TotalSeconds, 1); Note = $msg })
     Write-Host "::error title=$Name::$($_.Exception.Message)"
     Log "FAIL $Name`n$msg"
+    Dump-AgentLogs $Name
   }
 }
 
@@ -90,6 +111,7 @@ function Remove-AgentCompletely {
   & schtasks.exe /delete /tn "AIRMM Watchdog" /f 2>&1 | Out-Null
   Start-Sleep -Seconds 4
   Remove-Item -Recurse -Force $PF, $PD -ErrorAction SilentlyContinue
+  if (Test-Path $PF) { Start-Sleep 5; Remove-Item -Recurse -Force $PF -ErrorAction SilentlyContinue }
 }
 
 # =====================================================================
@@ -390,7 +412,7 @@ Step 'watchdog rolls back a broken update' {
   $before = [DateTimeOffset]::UtcNow
   Wait-Until { (Agent $AgentId).online -and [DateTimeOffset]::Parse((Agent $AgentId).last_seen) -ge $before.AddSeconds(-2) } 90 'agent reporting after rollback'
   Assert (-not (Test-Path "$PD\update-pending.json")) 'marker cleared'
-  try { Get-Content "$PD\watchdog.log" -Tail 5 -ErrorAction Stop | ForEach-Object { Log "watchdog.log: $_" } } catch { Log "watchdog.log unreadable: $($_.Exception.Message)" }
+  Log "watchdog.log:`n$(Read-Shared "$PD\watchdog.log" 6)"
 }
 
 Step 'watchdog repairs a corrupt binary without an update marker' {
@@ -416,7 +438,7 @@ Step 'push install: prepare local admin account and source agent' {
   $tok = (Api POST 'enroll-tokens' @{ name = 'itest-source'; groups = @('itest-source') }).token
   $srcDir = Join-Path $WorkDir 'source'
   & "$WorkDir\rmm-agent.exe" configure --config "$srcDir\agent.json" --server $Url --token $tok --pubkey $PubKey --tls-pin $Pin | Out-Null
-  $p = Start-Process "$WorkDir\rmm-agent.exe" -ArgumentList 'run', '--config', "$srcDir\agent.json" -PassThru -NoNewWindow -RedirectStandardError "$WorkDir\source-agent.log"
+  $p = Start-Process "$WorkDir\rmm-agent.exe" -ArgumentList 'run', '--config', "$srcDir\agent.json", '--log', "$WorkDir\source-agent.log" -PassThru -WindowStyle Hidden
   $script:procs += $p
   Wait-Until { @(Agents | Where-Object { $_.groups -contains 'itest-source' -and $_.online }).Count -eq 1 } 60 'source agent enrolled'
   $script:SourceId = (Agents | Where-Object { $_.groups -contains 'itest-source' })[0].id
@@ -426,8 +448,8 @@ function Deploy([hashtable]$Params) {
   $Params.computers = @($env:COMPUTERNAME)
   $j = (Run-Tool 'deploy_agent' $Params @($SourceId) 400)[0]
   if ($null -eq $j.result.data.results) {
-    $tail = (Get-Content "$WorkDir\source-agent.log" -Tail 15 -ErrorAction SilentlyContinue) -join "`n"
-    throw "deploy job has no per-computer results: status=$($j.status) stderr=$($j.result.stderr)`nsource agent log:`n$tail"
+    $src = Agent $SourceId
+    throw "deploy job has no per-computer results: status=$($j.status) stderr=$($j.result.stderr); source agent online=$($src.online) last_seen=$($src.last_seen)"
   }
   $j
 }
@@ -455,6 +477,7 @@ Step 'push install: dry run sees the existing agent' {
 Step 'push install: fresh install onto a machine without the agent' {
   & "$PF\rmm-agent.exe" uninstall --purge | Out-Null
   Wait-Until { -not (Get-Service AIRMMAgent -ErrorAction SilentlyContinue) } 30 'service removed'
+  Wait-Until { -not (Test-Path $PF) } 45 'Program Files\AIRMM removed by purge'
   Assert (-not (& schtasks.exe /query /tn "AIRMM Watchdog" 2>$null)) 'watchdog task removed on uninstall'
   Start-Sleep 5
   $j = Deploy @{ credential = 'itest-deploy'; dry_run = $true }
@@ -489,7 +512,7 @@ if (-not $SkipMsi -and (Get-Command wix -ErrorAction SilentlyContinue)) {
     $tok = (Api POST 'enroll-tokens' @{ name = 'itest-msi'; groups = @('itest-msi') }).token
     $p = Start-Process msiexec.exe -ArgumentList "/i `"$WorkDir\airmm-0.0.4.msi`" /qn /l*v `"$WorkDir\msi-install.log`" SERVER_URL=$Url ENROLL_TOKEN=$tok SERVER_PUBKEY=$PubKey TLS_PIN=$Pin" -Wait -PassThru
     Assert ($p.ExitCode -eq 0) "msiexec install exit $($p.ExitCode)"
-    Assert ((Get-Service AIRMMAgent).Status -eq 'Running') 'service running after MSI'
+    Wait-Until { (Get-Service AIRMMAgent -ErrorAction SilentlyContinue).Status -eq 'Running' } 45 'service running after MSI'
     Wait-Until { @(Agents | Where-Object { $_.groups -contains 'itest-msi' -and $_.online }).Count -eq 1 } 60 'MSI agent enrolled'
     $id = (Agents | Where-Object { $_.groups -contains 'itest-msi' })[0].id
     $p = Start-Process msiexec.exe -ArgumentList "/i `"$WorkDir\airmm-0.0.5.msi`" /qn /l*v `"$WorkDir\msi-upgrade.log`"" -Wait -PassThru
@@ -513,16 +536,17 @@ Step 'Install-AIRMMAgent.ps1 (GPO-style) install, then idempotent re-run' {
   & "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -ExecutionPolicy Bypass -File "$src\Install-AIRMMAgent.ps1" -ConfigFile "$src\airmm.conf"
   Assert ($LASTEXITCODE -eq 0) "install script exit $LASTEXITCODE"
   Wait-Until { @(Agents | Where-Object { $_.groups -contains 'itest-gpo' -and $_.online }).Count -eq 1 } 60 'GPO-style agent enrolled'
+  Wait-Until { (Get-Service AIRMMAgent).Status -eq 'Running' } 30 'service running before re-run'
   $out = & "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -ExecutionPolicy Bypass -File "$src\Install-AIRMMAgent.ps1" -ConfigFile "$src\airmm.conf" | Out-String
   Assert ($LASTEXITCODE -eq 0 -and $out -match 'Nothing to do') "re-run: $out"
 }
 
 Step 'Uninstall script with -Purge leaves nothing behind' {
   & "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -ExecutionPolicy Bypass -File (Join-Path $Root 'installer\Uninstall-AIRMMAgent.ps1') -Purge
-  Start-Sleep 6
-  Assert (-not (Get-Service AIRMMAgent -ErrorAction SilentlyContinue)) 'service gone'
+  Wait-Until { -not (Get-Service AIRMMAgent -ErrorAction SilentlyContinue) } 30 'service gone'
   Assert (-not (Test-Path $PD)) 'ProgramData\AIRMM removed'
-  Assert (-not (Test-Path $PF)) 'Program Files\AIRMM removed'
+  Wait-Until { -not (Test-Path $PF) } 45 'Program Files\AIRMM removed'
+  Assert (-not (& schtasks.exe /query /tn "AIRMM Watchdog" 2>$null)) 'watchdog task removed'
 }
 
 # =====================================================================
