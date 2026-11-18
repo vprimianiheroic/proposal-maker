@@ -72,7 +72,7 @@ func setupFull(t *testing.T, mutateCfg func(*server.Config), mutateAgent func(c 
 	tok, _, err := s.CreateEnrollToken(admin, "t", []string{"plant1"}, time.Hour, 0)
 	must(t, err)
 	hs := httptest.NewServer(s.Handler())
-	t.Cleanup(hs.Close)
+	t.Cleanup(func() { hs.Close(); s.Close() })
 
 	adir := t.TempDir()
 	ps := filepath.Join(adir, "fakeps.sh")

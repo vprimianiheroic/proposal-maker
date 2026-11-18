@@ -126,7 +126,9 @@ func (s *Server) Audit(actor, action string, detail interface{}) {
 	b, _ := json.Marshal(e)
 	s.auditMu.Lock()
 	defer s.auditMu.Unlock()
-	_, _ = s.audit.Write(append(b, '\n'))
+	if s.audit != nil {
+		_, _ = s.audit.Write(append(b, '\n'))
+	}
 }
 
 // ReadAudit returns the last n audit entries (newest last).
@@ -213,3 +215,15 @@ func (s *Server) background(ctx context.Context) {
 
 // Flush persists state immediately (used by tests and CLI commands).
 func (s *Server) Flush() error { return s.store.flush() }
+
+// Close releases open files (the audit log). Call after Run returns.
+func (s *Server) Close() error {
+	s.auditMu.Lock()
+	defer s.auditMu.Unlock()
+	if s.audit == nil {
+		return nil
+	}
+	err := s.audit.Close()
+	s.audit = nil
+	return err
+}

@@ -61,7 +61,9 @@ func main() {
 		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 		defer stop()
 		log.Printf("ai-rmm server %s, data %s, %d built-in tools", version, *dir, len(s.ListTools()))
-		if err := s.Run(ctx); err != nil {
+		err := s.Run(ctx)
+		s.Close()
+		if err != nil {
 			fatal(err)
 		}
 	case "apikey":
