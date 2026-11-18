@@ -97,7 +97,10 @@ function Run-Tool([string]$Tool, [hashtable]$Params = @{}, [string[]]$Targets = 
   return $r.jobs
 }
 
-function Agents { @(Api GET 'agents') }
+# Invoke-RestMethod (PS 7) returns a JSON array as ONE pipeline object;
+# enumerate it so Where-Object sees each element.
+function Items($x) { foreach ($i in $x) { $i } }
+function Agents { Items (Api GET 'agents') }
 function Agent([string]$Id) { Api GET "agents/$Id" }
 
 function Build-Agent([string]$Out, [string]$Version) {
@@ -256,6 +259,14 @@ foreach ($c in $toolCases) {
   }
 }
 
+Step 'diag: network_config traced' {
+  $src = (Api GET 'tools/network_config').script
+  $j = (Run-Tool -Tool '' -Script ("Set-PSDebug -Trace 1`n" + $src) -Timeout 30 -Wait 45)[0]
+  $lines = @("$($j.result.stdout)`n$($j.result.stderr)" -split "`r?`n" | Where-Object { $_ })
+  Write-Host ("network_config trace (last 40 lines), status=$($j.status):`n" + (($lines | Select-Object -Last 40) -join "`n"))
+  "status=$($j.status)"
+}
+
 Step 'diag: network_config sections timing' {
   $parts = [ordered]@{
     nics    = '$sw=[Diagnostics.Stopwatch]::StartNew(); $n=@([System.Net.NetworkInformation.NetworkInterface]::GetAllNetworkInterfaces()); [pscustomobject]@{count=$n.Count; ms=$sw.ElapsedMilliseconds}'
@@ -378,7 +389,7 @@ Step 'network monitoring: device goes up, then down' {
   Assert ($dv.status.ping_ok -and $dv.status.ports.$Port) "status $($dv.status | ConvertTo-Json -Compress)"
   $d2 = Api POST 'devices' @{ name = 'itest-closed-port'; address = '127.0.0.1'; kind = 'other'; collector_agent_id = $AgentId; interval_sec = 30; tcp_ports = @(1) }
   Wait-Until { (Api GET "devices/$($d2.id)").status.state -eq 'down' } 180 'device down after two failed checks'
-  Assert (@(Api GET 'events?type=device_down' | Where-Object { $_.subject -eq 'itest-closed-port' }).Count -ge 1) 'device_down event'
+  Assert (@(Items (Api GET 'events?type=device_down') | Where-Object { $_.subject -eq 'itest-closed-port' }).Count -ge 1) 'device_down event'
   Api DELETE "devices/$($d2.id)" | Out-Null
   "latency $($dv.status.latency_ms) ms"
 }
