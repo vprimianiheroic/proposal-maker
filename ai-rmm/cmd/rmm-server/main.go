@@ -95,7 +95,7 @@ func main() {
 		groups := fs.String("groups", "", "limit rollout to these agent groups (canary); empty = all")
 		_ = fs.Parse(args)
 		s := mustServer(*dir)
-		check(addRelease(s, *dir, *file, *ver, *arch, *variant, splitCSV(*groups)))
+		check(addRelease(s, *file, *ver, *arch, *variant, splitCSV(*groups)))
 		check(s.Flush())
 	case "credential":
 		// rmm-server credential set|list|delete ...
@@ -158,8 +158,9 @@ func usage() {
   rmm-server credential   set --name domain-deploy --kind windows --username 'CORP\svc-rmm' < secrets.txt
   rmm-server credential   list | delete --name NAME
 
-Stop the server before running apikey / enroll-token / release against the same
-data dir, or use the dashboard / REST API while it runs.
+Stop the server before running apikey / enroll-token / release / credential
+against the same data dir, or use the console / REST API while it runs
+(e.g. POST /api/v1/releases?version=1.2.0&arch=amd64 with the .exe as body).
 `)
 }
 
@@ -290,37 +291,20 @@ func selfSignedCert(dir string, hosts []string) (string, error) {
 	return hex.EncodeToString(sum[:]), nil
 }
 
-func addRelease(s *server.Server, dir, file, ver, arch, variant string, groups []string) error {
+func addRelease(s *server.Server, file, ver, arch, variant string, groups []string) error {
 	if file == "" || ver == "" {
 		return fmt.Errorf("--file and --version are required")
-	}
-	if variant != "" && variant != "legacy" {
-		return fmt.Errorf(`--variant must be "" or "legacy"`)
 	}
 	in, err := os.Open(file)
 	if err != nil {
 		return err
 	}
 	defer in.Close()
-	suffix := ""
-	if variant != "" {
-		suffix = "-" + variant
-	}
-	name := fmt.Sprintf("rmm-agent-%s-windows-%s%s.exe", ver, arch, suffix)
-	out, err := os.Create(filepath.Join(dir, "releases", name))
+	r, err := s.PublishRelease(cli, in, ver, arch, variant, groups)
 	if err != nil {
 		return err
 	}
-	h := sha256.New()
-	if _, err := io.Copy(io.MultiWriter(out, h), in); err != nil {
-		out.Close()
-		return err
-	}
-	out.Close()
-	sha := hex.EncodeToString(h.Sum(nil))
-	sig := s.SignUpdate("windows", arch, variant, ver, sha)
-	s.AddRelease(cli, &server.Release{OS: "windows", Arch: arch, Variant: variant, Version: ver, File: name, SHA256: sha, Signature: sig, Groups: groups, CreatedAt: time.Now().Unix()})
-	fmt.Printf("release %s (%s/%s%s) published as %s, sha256 %s\n", ver, "windows", arch, suffix, name, sha)
+	fmt.Printf("release %s (windows/%s %s) published as %s, sha256 %s\n", r.Version, r.Arch, r.Variant, r.File, r.SHA256)
 	return nil
 }
 

@@ -777,6 +777,17 @@ func (s *Server) handleAPI(w http.ResponseWriter, r *http.Request) {
 		}
 		writeJSON(w, 200, map[string]bool{"ok": true})
 
+	case route == "releases" && m == "GET":
+		writeJSON(w, 200, s.ListReleases())
+	case route == "releases" && m == "POST":
+		// Body is the raw agent .exe; metadata in the query string.
+		r.Body = http.MaxBytesReader(w, r.Body, 200<<20)
+		rel, err := s.PublishRelease(c, r.Body, q.Get("version"), q.Get("arch"), q.Get("variant"), strings.Split(q.Get("groups"), ","))
+		if err != nil {
+			writeErr(w, 400, err)
+			return
+		}
+		writeJSON(w, 200, rel)
 	case route == "events" && m == "GET":
 		since, _ := strconv.ParseInt(q.Get("since"), 10, 64)
 		lim, _ := strconv.Atoi(q.Get("limit"))

@@ -1,0 +1,61 @@
+# Real-Windows integration test for ai-rmm/. When ai-rmm moves to its own
+# repository, move this file to its .github/workflows/ and drop the
+# "ai-rmm/" path prefixes and working-directory.
+name: ai-rmm windows integration
+on:
+  push:
+    paths: ['ai-rmm/**', '.github/workflows/ai-rmm-windows.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  legacy-compile:
+    name: Go 1.20 (Win7/2008R2 toolchain) compile + unit tests
+    runs-on: ubuntu-latest
+    defaults: { run: { working-directory: ai-rmm } }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with: { go-version: '1.20.14', cache-dependency-path: ai-rmm/go.sum }
+      - run: go vet ./... && GOOS=windows go vet ./...
+      - run: for a in amd64 386; do GOOS=windows GOARCH=$a go build -o /dev/null ./cmd/rmm-agent; done
+      - run: go test -count=1 ./...
+
+  windows:
+    name: ${{ matrix.os }} / Go ${{ matrix.go }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: windows-2022, go: '1.24.x' }
+          - { os: windows-2025, go: '1.24.x' }
+          - { os: windows-2022, go: '1.20.14' }   # the legacy toolchain's binaries, run for real
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    defaults: { run: { working-directory: ai-rmm } }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with: { go-version: '${{ matrix.go }}', cache-dependency-path: ai-rmm/go.sum }
+      - name: Unit tests (Windows)
+        run: go test -count=1 ./...
+      - name: Install WiX
+        run: dotnet tool install --global wix --version 5.0.2
+      - name: Integration test
+        shell: pwsh
+        run: ./test/windows/integration.ps1
+      - name: Collect logs
+        if: always()
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force $env:RUNNER_TEMP\logs | Out-Null
+          Copy-Item $env:RUNNER_TEMP\airmm-itest\*.log $env:RUNNER_TEMP\logs -ErrorAction SilentlyContinue
+          Copy-Item $env:ProgramData\AIRMM\*.log $env:RUNNER_TEMP\logs -ErrorAction SilentlyContinue
+          Copy-Item $env:RUNNER_TEMP\airmm-itest\data\audit.jsonl $env:RUNNER_TEMP\logs -ErrorAction SilentlyContinue
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: itest-logs-${{ matrix.os }}-go${{ matrix.go }}
+          path: ${{ runner.temp }}/logs

@@ -451,6 +451,16 @@ func UninstallService(purge bool) error {
 		}
 		s.Close()
 	}
+	// Remove files the MSI doesn't know about (watchdog copy, rollback
+	// builds); never the running executable itself.
+	if self, err := os.Executable(); err == nil {
+		dir := filepath.Join(filepath.Dir(self))
+		for _, n := range []string{"rmm-watchdog.exe", "rmm-watchdog.exe.tmp", "rmm-agent.exe.old", "rmm-agent.exe.bad", "rmm-agent.exe.prev", "rmm-agent.exe.new"} {
+			if p := filepath.Join(dir, n); !strings.EqualFold(p, self) {
+				_ = os.Remove(p)
+			}
+		}
+	}
 	if purge {
 		_ = os.RemoveAll(DefaultDataDir())
 		// The binary may be the one running this command; schedule removal.
