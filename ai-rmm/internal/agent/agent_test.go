@@ -4,8 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"net"
+	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/airmm/airmm/internal/protocol"
 )
@@ -76,5 +78,24 @@ func TestEndpointsKeepInstallURL(t *testing.T) {
 	got := strings.Join(c.Endpoints(), ",")
 	if got != "https://new:8443,https://10.0.0.5:8443,https://old:8443" {
 		t.Fatal(got)
+	}
+}
+
+func TestUpdateMarkerStampedOnce(t *testing.T) {
+	dir := t.TempDir()
+	p := dir + "/" + updateMarker
+	if err := os.WriteFile(p, []byte(`{"from":"1","to":"2"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cleanupOldBinary(dir)
+	b1, _ := os.ReadFile(p)
+	time.Sleep(1100 * time.Millisecond)
+	cleanupOldBinary(dir) // crash-loop restart must not reset the clock
+	b2, _ := os.ReadFile(p)
+	if string(b1) != string(b2) || !strings.Contains(string(b1), "started_at") {
+		t.Fatalf("marker restamped: %s vs %s", b1, b2)
+	}
+	if age, ok := markerAge(p); !ok || age < time.Second {
+		t.Fatalf("age %v", age)
 	}
 }

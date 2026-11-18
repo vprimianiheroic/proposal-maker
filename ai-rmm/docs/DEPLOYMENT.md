@@ -136,11 +136,13 @@ push it to the rest of the domain without GPO:
    `deploy_agent` with `dry_run` in batches of 25, grouped correctly (`ot`
    machines in their own batch). Each batch is one approval card in the console.
 
-How it works on each target: the source machine authenticates to
-`\\target\ADMIN$` with the vault credential, copies the agent and a bootstrap
-config holding a **single-use enrollment token** (valid 3 hours) that the
-server minted for that computer only, then creates a one-shot `AIRMMSetup`
-service over the same SMB session. That service installs the agent normally
+How it works on each target: the source machine takes on the vault
+credential for outbound connections only (`LogonUser` NEW_CREDENTIALS,
+which never clashes with existing SMB sessions, including to DCs). It
+copies the agent and a bootstrap config holding a **single-use enrollment
+token** (valid 3 hours, minted for that computer only) into a
+randomly-named `%SystemRoot%\Temp` folder locked to SYSTEM and
+Administrators, then creates a one-shot `AIRMMSetup` service. That service installs the agent normally
 (Program Files, `AIRMMAgent` service, watchdog), deletes the token file and
 exits. The setup service and files are then removed. Neither the password nor
 the token ever appears on a command line.
@@ -180,9 +182,12 @@ Several layers keep an agent reachable:
   - re-creates the service if it was deleted, and re-enables it if it was disabled
   - starts it if it was stopped
   - restarts it if it has had no server contact for an hour
-  - **rolls back** a self-update that hasn't reached the server within 15 minutes
+  - **rolls back** a self-update that hasn't reached the server within 15 minutes of first starting
+  - restores the binary if antivirus quarantined or deleted it
 
-  The watchdog copy is refreshed only after a new build has talked to the server successfully.
+  The watchdog task is set to run on battery too. Its copy, and the previous build kept as
+  `rmm-agent.exe.old`, are replaced only after a new build has run with server contact for
+  24 hours.
 - **Address failover**: set `agent_server_urls` in `config.json`, e.g.
   `["https://rmm.corp.local:8443", "https://10.0.0.25:8443"]`. Every agent
   stores the list and fails over in order. It also keeps the address it was

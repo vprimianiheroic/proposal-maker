@@ -4,6 +4,7 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -11,7 +12,9 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+	"unicode/utf16"
 
+	"golang.org/x/sys/windows"
 	"golang.org/x/sys/windows/svc"
 	"golang.org/x/sys/windows/svc/mgr"
 )
@@ -175,12 +178,58 @@ func installWatchdog(agentExe string) error {
 	if err := copyPlain(agentExe, wd); err != nil && !fileExists(wd) {
 		return err
 	}
-	out, err := exec.Command("schtasks.exe", "/create", "/tn", watchdogTask, "/tr", `"`+wd+`" watchdog`,
-		"/sc", "minute", "/mo", "10", "/ru", "SYSTEM", "/rl", "HIGHEST", "/f").CombinedOutput()
+	// XML rather than /sc flags: schtasks' defaults would stop the task on
+	// battery (laptops on the shop floor) and allow overlapping runs.
+	xml := `<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo><Description>Keeps the AI-RMM agent installed, running and reachable.</Description></RegistrationInfo>
+  <Triggers>
+    <BootTrigger><Enabled>true</Enabled><Delay>PT5M</Delay></BootTrigger>
+    <TimeTrigger><StartBoundary>2020-01-01T00:00:00</StartBoundary><Enabled>true</Enabled>
+      <Repetition><Interval>PT10M</Interval><StopAtDurationEnd>false</StopAtDurationEnd></Repetition></TimeTrigger>
+  </Triggers>
+  <Principals><Principal id="Author"><UserId>S-1-5-18</UserId><RunLevel>HighestAvailable</RunLevel></Principal></Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <StartWhenAvailable>true</StartWhenAvailable>
+    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>
+    <IdleSettings><StopOnIdleEnd>false</StopOnIdleEnd><RestartOnIdle>false</RestartOnIdle></IdleSettings>
+    <AllowStartOnDemand>true</AllowStartOnDemand>
+    <Enabled>true</Enabled>
+    <Hidden>false</Hidden>
+    <ExecutionTimeLimit>PT10M</ExecutionTimeLimit>
+    <Priority>7</Priority>
+  </Settings>
+  <Actions Context="Author"><Exec><Command>` + xmlEscape(wd) + `</Command><Arguments>watchdog</Arguments></Exec></Actions>
+</Task>`
+	f := filepath.Join(DefaultDataDir(), "watchdog-task.xml")
+	if err := os.WriteFile(f, utf16File(xml), 0o600); err != nil {
+		return err
+	}
+	defer os.Remove(f)
+	out, err := exec.Command("schtasks.exe", "/create", "/tn", watchdogTask, "/xml", f, "/f").CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("%v: %s", err, out)
 	}
 	return nil
+}
+
+func xmlEscape(s string) string {
+	r := strings.NewReplacer("&", "&amp;", "<", "&lt;", ">", "&gt;", `"`, "&quot;")
+	return r.Replace(s)
+}
+
+// utf16File encodes as UTF-16LE with BOM, which schtasks /xml requires.
+func utf16File(s string) []byte {
+	u := utf16.Encode([]rune(s))
+	b := make([]byte, 2+2*len(u))
+	b[0], b[1] = 0xFF, 0xFE
+	for i, c := range u {
+		b[2+2*i], b[3+2*i] = byte(c), byte(c>>8)
+	}
+	return b
 }
 
 func fileExists(p string) bool {
@@ -188,11 +237,18 @@ func fileExists(p string) bool {
 	return err == nil
 }
 
-var lastPromote time.Time
+var (
+	lastPromote  time.Time
+	processStart = time.Now()
+)
 
-// promoteWatchdog refreshes the watchdog copy from the running (healthy) build.
+// promoteWatchdog refreshes the watchdog copy from the running build, but
+// only after this build has run and kept server contact for 24 hours. Until
+// then the previous build stays as both the watchdog and rmm-agent.exe.old,
+// so a build that is subtly broken (crashes later, breaks updates) can
+// still be rolled back.
 func promoteWatchdog() {
-	if time.Since(lastPromote) < 10*time.Minute || !IsService() {
+	if time.Since(processStart) < 24*time.Hour || time.Since(lastPromote) < 10*time.Minute || !IsService() {
 		return
 	}
 	lastPromote = time.Now()
@@ -204,12 +260,12 @@ func promoteWatchdog() {
 	si, err1 := os.Stat(self)
 	wi, err2 := os.Stat(wd)
 	if err1 != nil || (err2 == nil && !wi.ModTime().Before(si.ModTime())) {
+		_ = os.Remove(self + ".old")
 		return
 	}
 	tmp := wd + ".tmp"
-	if copyPlain(self, tmp) == nil {
-		_ = os.Remove(wd)
-		_ = os.Rename(tmp, wd)
+	if copyPlain(self, tmp) == nil && os.Rename(tmp, wd) == nil { // Rename replaces atomically
+		_ = os.Remove(self + ".old")
 	}
 }
 
@@ -257,26 +313,57 @@ func Watchdog() error {
 	}
 	defer s.Close()
 
-	if c, err := s.Config(); err == nil && c.StartType == mgr.StartDisabled {
+	if c, err := s.Config(); err != nil {
+		logf("read service config: %v", err)
+	} else if c.StartType == mgr.StartDisabled {
 		c.StartType = mgr.StartAutomatic
 		if err := s.UpdateConfig(c); err == nil {
 			logf("agent service was disabled; re-enabled")
 		}
 	}
 
-	marker := filepath.Join(dataDir, updateMarker)
-	if mi, err := os.Stat(marker); err == nil && time.Since(mi.ModTime()) > 15*time.Minute && fileExists(agentExe+".old") {
-		logf("self-update never reached the server within 15 minutes; rolling back")
+	// restore puts a known-good build back: the previous build if kept,
+	// otherwise this watchdog's own copy.
+	restore := func(why string) error {
+		logf("%s; restoring a known-good agent binary", why)
 		_ = stopService(s)
+		src := agentExe + ".old"
+		if !fileExists(src) {
+			src = self
+		}
 		_ = os.Remove(agentExe + ".bad")
-		if err := os.Rename(agentExe, agentExe+".bad"); err == nil {
-			if err := os.Rename(agentExe+".old", agentExe); err != nil {
-				_ = os.Rename(agentExe+".bad", agentExe)
-				logf("rollback failed: %v", err)
+		if fileExists(agentExe) {
+			if err := os.Rename(agentExe, agentExe+".bad"); err != nil {
+				logf("move bad binary aside: %v", err)
+				return err
 			}
 		}
-		_ = os.Remove(marker)
+		var err error
+		if src == self {
+			err = copyPlain(self, agentExe)
+		} else {
+			err = os.Rename(src, agentExe)
+		}
+		if err != nil {
+			logf("restore failed: %v", err)
+			if fileExists(agentExe + ".bad") {
+				_ = os.Rename(agentExe+".bad", agentExe)
+			}
+			return err
+		}
+		_ = os.Remove(filepath.Join(dataDir, updateMarker))
 		return s.Start()
+	}
+
+	// The new build stamps its first start into the marker, so this measures
+	// "15 minutes since it first ran without ever reaching the server".
+	marker := filepath.Join(dataDir, updateMarker)
+	if age, ok := markerAge(marker); ok && age > 15*time.Minute {
+		return restore("self-update never reached the server within 15 minutes")
+	}
+	// AV quarantine or deletion of the agent binary.
+	if !fileExists(agentExe) {
+		return restore("agent binary is missing")
 	}
 
 	st, err := s.Query()
@@ -286,7 +373,12 @@ func Watchdog() error {
 	switch st.State {
 	case svc.Stopped:
 		logf("agent service was stopped; starting")
-		return s.Start()
+		err := s.Start()
+		var en windows.Errno
+		if errors.As(err, &en) && (en == windows.ERROR_FILE_NOT_FOUND || en == windows.ERROR_PATH_NOT_FOUND || en == windows.ERROR_BAD_EXE_FORMAT) {
+			return restore(fmt.Sprintf("agent binary will not start (%v)", err))
+		}
+		return err
 	case svc.Running:
 		// Running but silent for an hour: hung process or wedged network
 		// stack. A restart is cheap and often fixes it.
@@ -321,6 +413,12 @@ func (bootstrapHandler) Execute(_ []string, req <-chan svc.ChangeRequest, st cha
 		cfg, err := LoadConfig(filepath.Join(dir, "agent.json"))
 		if err != nil {
 			return err
+		}
+		// Forced reinstall over an enrolled agent: keep its identity
+		// rather than enrolling a duplicate.
+		if old, err := LoadConfig(DefaultConfigPath()); err == nil && old.AgentID != "" &&
+			strings.TrimRight(old.ServerURL, "/") == strings.TrimRight(cfg.ServerURL, "/") {
+			cfg.AgentID, cfg.AgentSecret, cfg.EnrollToken = old.AgentID, old.AgentSecret, ""
 		}
 		return InstallService(cfg, false)
 	}()
@@ -367,7 +465,10 @@ func stopService(s *mgr.Service) error {
 		return err
 	}
 	deadline := time.Now().Add(30 * time.Second)
-	for st.State != svc.Stopped && time.Now().Before(deadline) {
+	for st.State != svc.Stopped {
+		if time.Now().After(deadline) {
+			return errors.New("service did not stop within 30 seconds")
+		}
 		time.Sleep(500 * time.Millisecond)
 		if st, err = s.Query(); err != nil {
 			return err
@@ -390,9 +491,17 @@ func copyFile(src, dst string) error {
 	defer in.Close()
 	// If a previous version is running, rename it out of the way first.
 	if _, err := os.Stat(dst); err == nil {
-		_ = os.Remove(dst + ".old")
-		if err := os.Rename(dst, dst+".old"); err != nil {
-			return err
+		if fileExists(filepath.Join(DefaultDataDir(), updateMarker)) && fileExists(dst+".old") {
+			// keep the rollback target; park the current file elsewhere
+			_ = os.Remove(dst + ".prev")
+			if err := os.Rename(dst, dst+".prev"); err != nil {
+				return err
+			}
+		} else {
+			_ = os.Remove(dst + ".old")
+			if err := os.Rename(dst, dst+".old"); err != nil {
+				return err
+			}
 		}
 	}
 	out, err := os.OpenFile(dst, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o755)

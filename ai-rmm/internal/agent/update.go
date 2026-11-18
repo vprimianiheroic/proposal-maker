@@ -96,13 +96,42 @@ func (a *Agent) applyUpdate(ctx context.Context, u *protocol.UpdateInfo) error {
 
 const updateMarker = "update-pending.json"
 
-// cleanupOldBinary removes the previous build once no rollback can be
-// needed (no pending update marker).
+// cleanupOldBinary runs at startup. If this build was just installed by a
+// self-update it re-stamps the marker so the watchdog's 15-minute rollback
+// clock starts now (not when the update was staged, possibly before a
+// sleep or reboot). The previous build (.old) is kept until the new one
+// has proven itself for 24h (see promoteWatchdog).
 func cleanupOldBinary(dataDir string) {
-	if _, err := os.Stat(filepath.Join(dataDir, updateMarker)); err == nil {
+	marker := filepath.Join(dataDir, updateMarker)
+	b, err := os.ReadFile(marker)
+	if err != nil {
 		return
 	}
-	if exe, err := os.Executable(); err == nil {
-		_ = os.Remove(exe + ".old")
+	var m map[string]interface{}
+	if json.Unmarshal(b, &m) != nil {
+		m = map[string]interface{}{}
 	}
+	// Stamp the first start only: a crash-looping build must not keep
+	// resetting the watchdog's rollback clock.
+	if _, ok := m["started_at"]; !ok {
+		m["started_at"] = time.Now().Unix()
+		nb, _ := json.Marshal(m)
+		_ = os.WriteFile(marker, nb, 0o600)
+	}
+}
+
+// markerAge is how long the updated build has been trying to reach the
+// server (falls back to the file time for markers without started_at).
+func markerAge(path string) (time.Duration, bool) {
+	fi, err := os.Stat(path)
+	if err != nil {
+		return 0, false
+	}
+	var m struct {
+		StartedAt int64 `json:"started_at"`
+	}
+	if b, err := os.ReadFile(path); err == nil && json.Unmarshal(b, &m) == nil && m.StartedAt > 0 {
+		return time.Since(time.Unix(m.StartedAt, 0)), true
+	}
+	return time.Since(fi.ModTime()), true
 }

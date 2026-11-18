@@ -4,6 +4,7 @@ package agent
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -14,6 +15,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -27,9 +29,10 @@ import (
 )
 
 // Push-install, PsExec style:
-//   1. authenticate an SMB session to \\target\ADMIN$ with the vault credential
+//   1. impersonate the vault credential (LogonUser NEW_CREDENTIALS) on a
+//      locked OS thread, so SMB and remote SCM calls use it
 //   2. copy rmm-agent.exe + a bootstrap config (single-use enrollment token)
-//      to %SystemRoot%\Temp\AIRMM-Setup on the target
+//      to a random, SYSTEM/Administrators-only folder in %SystemRoot%\Temp
 //   3. over the same session, create and start a one-shot "AIRMMSetup"
 //      service that runs `rmm-agent.exe bootstrap`, which performs a normal
 //      install (Program Files, AIRMMAgent service, watchdog) and exits
@@ -39,57 +42,73 @@ import (
 const setupService = "AIRMMSetup"
 
 var (
-	mpr                      = windows.NewLazySystemDLL("mpr.dll")
-	procWNetAddConnection2W  = mpr.NewProc("WNetAddConnection2W")
-	procWNetCancelConnection = mpr.NewProc("WNetCancelConnection2W")
+	advapi32                    = windows.NewLazySystemDLL("advapi32.dll")
+	procLogonUserW              = advapi32.NewProc("LogonUserW")
+	procImpersonateLoggedOnUser = advapi32.NewProc("ImpersonateLoggedOnUser")
 )
 
-type netResource struct {
-	Scope       uint32
-	Type        uint32
-	DisplayType uint32
-	Usage       uint32
-	LocalName   *uint16
-	RemoteName  *uint16
-	Comment     *uint16
-	Provider    *uint16
+const (
+	logon32LogonNewCredentials = 9 // outbound-only: network access uses these creds
+	logon32ProviderWinNT50     = 3
+)
+
+// splitUser accepts DOMAIN\user or user@domain (UPN, domain left empty).
+func splitUser(u string) (user, domain string) {
+	if i := strings.IndexByte(u, '\\'); i > 0 {
+		return u[i+1:], u[:i]
+	}
+	return u, ""
 }
 
-func wnetConnect(remote, user, pass string) error {
-	r16, _ := windows.UTF16PtrFromString(remote)
+// impersonate gives the calling OS thread a private outbound credential
+// context. Unlike WNetAddConnection2 this never conflicts with SYSTEM's
+// existing SMB sessions (e.g. the machine account's SYSVOL connection to a
+// DC), and it also covers RPC-over-TCP to the remote service manager.
+// The caller must hold runtime.LockOSThread and call windows.RevertToSelf.
+func impersonate(username, password string) (windows.Token, error) {
+	user, domain := splitUser(username)
 	u16, _ := windows.UTF16PtrFromString(user)
-	p16, _ := windows.UTF16PtrFromString(pass)
-	nr := netResource{Type: 1 /* RESOURCETYPE_DISK */, RemoteName: r16}
-	rc, _, _ := procWNetAddConnection2W.Call(uintptr(unsafe.Pointer(&nr)), uintptr(unsafe.Pointer(p16)), uintptr(unsafe.Pointer(u16)), 4 /* CONNECT_TEMPORARY */)
-	if rc == 1219 { // ERROR_SESSION_CREDENTIAL_CONFLICT: drop the old session and retry
-		wnetDisconnect(remote)
-		rc, _, _ = procWNetAddConnection2W.Call(uintptr(unsafe.Pointer(&nr)), uintptr(unsafe.Pointer(p16)), uintptr(unsafe.Pointer(u16)), 4)
+	p16, _ := windows.UTF16PtrFromString(password)
+	var d16 *uint16
+	if domain != "" {
+		d16, _ = windows.UTF16PtrFromString(domain)
 	}
-	if rc != 0 {
-		return syscallErr(rc)
+	var tok windows.Token
+	r, _, e := procLogonUserW.Call(uintptr(unsafe.Pointer(u16)), uintptr(unsafe.Pointer(d16)), uintptr(unsafe.Pointer(p16)),
+		logon32LogonNewCredentials, logon32ProviderWinNT50, uintptr(unsafe.Pointer(&tok)))
+	if r == 0 {
+		return 0, fmt.Errorf("LogonUser: %v", e)
 	}
-	return nil
+	if r, _, e := procImpersonateLoggedOnUser.Call(uintptr(tok)); r == 0 {
+		tok.Close()
+		return 0, fmt.Errorf("ImpersonateLoggedOnUser: %v", e)
+	}
+	return tok, nil
 }
 
-func wnetDisconnect(remote string) {
-	r16, _ := windows.UTF16PtrFromString(remote)
-	procWNetCancelConnection.Call(uintptr(unsafe.Pointer(r16)), 0, 1)
-}
-
-func syscallErr(rc uintptr) error {
-	switch rc {
+// explain maps common Win32 errors from remote operations to plain advice.
+func explain(err error) error {
+	var en windows.Errno
+	if !errors.As(err, &en) {
+		return err
+	}
+	switch en {
 	case 5:
 		return errors.New("access denied (credential is not a local administrator on the target, or UAC remote restrictions apply)")
 	case 53, 67:
-		return errors.New("network path not found (name doesn't resolve, or File and Printer Sharing is blocked)")
+		return errors.New("network path not found (File and Printer Sharing blocked, or name doesn't resolve)")
 	case 1326:
 		return errors.New("logon failure: wrong username or password")
 	case 1909:
 		return errors.New("the deployment account is locked out")
 	case 1331:
 		return errors.New("the deployment account is disabled")
+	case 1722:
+		return errors.New("RPC server unavailable (remote service control blocked by firewall)")
+	case 193:
+		return errors.New("installer build is incompatible with the target (publish a 386 legacy release so the server pushes a build that runs everywhere)")
 	}
-	return fmt.Errorf("%v (code %d)", windows.Errno(rc), rc)
+	return err
 }
 
 type deployResult struct {
@@ -170,7 +189,7 @@ func nativeDeployAgent(ctx context.Context, a *Agent, job *protocol.Job) (interf
 
 func (a *Agent) deployOne(ctx context.Context, host, user, pass, token, installer string, dryRun, force bool) deployResult {
 	fail := func(stage string, err error) deployResult {
-		return deployResult{Status: "failed", Stage: stage, Detail: err.Error()}
+		return deployResult{Status: "failed", Stage: stage, Detail: explain(err).Error()}
 	}
 	c, err := (&net.Dialer{Timeout: 5 * time.Second}).DialContext(ctx, "tcp", net.JoinHostPort(host, "445"))
 	if err != nil {
@@ -178,15 +197,24 @@ func (a *Agent) deployOne(ctx context.Context, host, user, pass, token, installe
 	}
 	c.Close()
 
-	share := `\\` + host + `\ADMIN$`
-	if err := wnetConnect(share, user, pass); err != nil {
+	// Everything below runs on one OS thread holding the deployment
+	// credential; file I/O and SCM calls are synchronous on that thread.
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	tok, err := impersonate(user, pass)
+	if err != nil {
 		return fail("authenticate", err)
 	}
-	defer wnetDisconnect(share)
+	defer tok.Close()
+	defer windows.RevertToSelf()
 
+	share := `\\` + host + `\ADMIN$`
+	if _, err := os.Stat(share + `\Temp`); err != nil {
+		return fail("authenticate", fmt.Errorf("cannot open %s: %w", share, unwrapPathErr(err)))
+	}
 	m, err := mgr.ConnectRemote(host)
 	if err != nil {
-		return fail("service_manager", fmt.Errorf("open remote service manager: %v", err))
+		return fail("service_manager", err)
 	}
 	defer m.Disconnect()
 	if s, err := m.OpenService(ServiceName); err == nil {
@@ -197,16 +225,19 @@ func (a *Agent) deployOne(ctx context.Context, host, user, pass, token, installe
 		}
 	}
 	if dryRun {
-		return deployResult{Status: "ok_dry_run", Detail: "SMB, ADMIN$ and remote service control all work with this credential"}
+		return deployResult{Status: "ok_dry_run", Detail: "ADMIN$ and remote service control both work with this credential"}
 	}
 	if token == "" {
 		return fail("token", errors.New("server did not issue an enrollment token for this computer"))
 	}
 
-	// Stage files.
-	dir := share + `\Temp\AIRMM-Setup`
-	_ = os.RemoveAll(dir)
-	if err := os.MkdirAll(dir, 0o700); err != nil {
+	// Stage files in a fresh, unguessable folder locked to SYSTEM and
+	// Administrators. %SystemRoot%\Temp lets ordinary users create files,
+	// so a predictable path would let a local user plant or swap the binary
+	// that the setup service runs as SYSTEM.
+	name := "AIRMM-Setup-" + randHex(8)
+	dir := share + `\Temp\` + name
+	if err := os.Mkdir(dir, 0o700); err != nil {
 		return fail("copy", err)
 	}
 	defer func() {
@@ -217,13 +248,16 @@ func (a *Agent) deployOne(ctx context.Context, host, user, pass, token, installe
 			time.Sleep(2 * time.Second)
 		}
 	}()
-	if err := copyPlain(installer, dir+`\rmm-agent.exe`); err != nil {
+	if err := protectDir(dir); err != nil {
+		return fail("copy", fmt.Errorf("secure staging folder: %w", err))
+	}
+	if err := copyExcl(installer, dir+`\rmm-agent.exe`); err != nil {
 		return fail("copy", err)
 	}
 	boot := &Config{ServerURL: a.Cfg.ServerURL, ServerURLs: a.Cfg.ServerURLs, InstallURL: a.Cfg.InstallURL,
 		ServerPubKey: a.Cfg.ServerPubKey, TLSPinSHA256: a.Cfg.TLSPinSHA256, EnrollToken: token}
 	b, _ := json.MarshalIndent(boot, "", "  ")
-	if err := os.WriteFile(dir+`\agent.json`, b, 0o600); err != nil {
+	if err := writeExcl(dir+`\agent.json`, b); err != nil {
 		return fail("copy", err)
 	}
 
@@ -232,11 +266,17 @@ func (a *Agent) deployOne(ctx context.Context, host, user, pass, token, installe
 		_, _ = old.Control(svc.Stop)
 		_ = old.Delete()
 		old.Close()
+	}
+	var s *mgr.Service
+	for i := 0; i < 10; i++ {
+		s, err = m.CreateService(setupService, `%SystemRoot%\Temp\`+name+`\rmm-agent.exe`, mgr.Config{
+			DisplayName: "AI-RMM Agent Setup", StartType: mgr.StartManual, ErrorControl: mgr.ErrorIgnore,
+		}, "bootstrap")
+		if !errors.Is(err, windows.ERROR_SERVICE_MARKED_FOR_DELETE) && !errors.Is(err, windows.ERROR_SERVICE_EXISTS) {
+			break
+		}
 		time.Sleep(2 * time.Second)
 	}
-	s, err := m.CreateService(setupService, `%SystemRoot%\Temp\AIRMM-Setup\rmm-agent.exe`, mgr.Config{
-		DisplayName: "AI-RMM Agent Setup", StartType: mgr.StartManual, ErrorControl: mgr.ErrorIgnore,
-	}, "bootstrap")
 	if err != nil {
 		return fail("create_setup_service", err)
 	}
@@ -249,18 +289,19 @@ func (a *Agent) deployOne(ctx context.Context, host, user, pass, token, installe
 	}
 	deadline := time.Now().Add(3 * time.Minute)
 	var st svc.Status
-	for time.Now().Before(deadline) {
-		if !sleepCtx(ctx, 2*time.Second) {
-			return fail("install", ctx.Err())
+	for {
+		time.Sleep(2 * time.Second) // plain sleep: stay on this impersonating thread
+		if st, err = s.Query(); err != nil {
+			return fail("install", fmt.Errorf("query setup service: %w", err))
 		}
-		if st, err = s.Query(); err != nil || st.State == svc.Stopped {
+		if st.State == svc.Stopped {
 			break
+		}
+		if time.Now().After(deadline) || ctx.Err() != nil {
+			return fail("install", errors.New("setup did not finish within 3 minutes"))
 		}
 	}
 	detail, _ := os.ReadFile(dir + `\bootstrap-result.txt`)
-	if st.State != svc.Stopped {
-		return fail("install", errors.New("setup did not finish within 3 minutes"))
-	}
 	if st.ServiceSpecificExitCode != 0 || st.Win32ExitCode != 0 && st.Win32ExitCode != uint32(windows.ERROR_SERVICE_SPECIFIC_ERROR) {
 		return fail("install", fmt.Errorf("setup exited with %d/%d: %s", st.Win32ExitCode, st.ServiceSpecificExitCode, strings.TrimSpace(string(detail))))
 	}
@@ -278,6 +319,64 @@ func (a *Agent) deployOne(ctx context.Context, host, user, pass, token, installe
 		time.Sleep(time.Second)
 	}
 	return fail("verify", fmt.Errorf("AIRMMAgent installed but not running (state %d)", st.State))
+}
+
+func unwrapPathErr(err error) error {
+	var pe *os.PathError
+	if errors.As(err, &pe) {
+		return explain(pe.Err)
+	}
+	return err
+}
+
+// protectDir replaces the folder's DACL with SYSTEM + Administrators only,
+// with inheritance from the parent blocked.
+func protectDir(dir string) error {
+	sd, err := windows.SecurityDescriptorFromString("D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)")
+	if err != nil {
+		return err
+	}
+	dacl, _, err := sd.DACL()
+	if err != nil {
+		return err
+	}
+	return windows.SetNamedSecurityInfo(dir, windows.SE_FILE_OBJECT,
+		windows.DACL_SECURITY_INFORMATION|windows.PROTECTED_DACL_SECURITY_INFORMATION, nil, nil, dacl, nil)
+}
+
+func randHex(n int) string {
+	b := make([]byte, n)
+	_, _ = rand.Read(b)
+	return hex.EncodeToString(b)
+}
+
+func writeExcl(path string, data []byte) error {
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	if err != nil {
+		return err
+	}
+	if _, err := f.Write(data); err != nil {
+		f.Close()
+		return err
+	}
+	return f.Close()
+}
+
+func copyExcl(src, dst string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	out, err := os.OpenFile(dst, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o700)
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(out, in); err != nil {
+		out.Close()
+		return err
+	}
+	return out.Close()
 }
 
 // download fetches a server-hosted build and checks the hash from the signed job.
