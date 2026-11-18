@@ -1,0 +1,24 @@
+# /etc/systemd/system/rmm-server.service
+# useradd --system --home /var/lib/rmm-server --shell /usr/sbin/nologin rmm
+# install -m 0755 rmm-server-linux-amd64 /usr/local/bin/rmm-server
+# sudo -u rmm rmm-server init --data /var/lib/rmm-server --url https://rmm.corp.local:8443
+[Unit]
+Description=AI-RMM control plane
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=rmm
+Group=rmm
+ExecStart=/usr/local/bin/rmm-server serve --data /var/lib/rmm-server
+Restart=always
+RestartSec=5
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ReadWritePaths=/var/lib/rmm-server
+AmbientCapabilities=
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,66 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  AI-RMM agent MSI (WiX Toolset v4/v5).
+  Build: see scripts/build-msi.ps1, e.g.
+    wix build Package.wxs -arch x64 -d Version=1.2.0 -d AgentExe=..\..\dist\rmm-agent-windows-amd64.exe -o airmm-agent-1.2.0-x64.msi
+
+  Silent install:
+    msiexec /i airmm-agent-x64.msi /qn SERVER_URL=https://rmm.corp.local:8443 ENROLL_TOKEN=et_... SERVER_PUBKEY=... [TLS_PIN=...]
+  Upgrade (keeps identity, no properties needed):
+    msiexec /i airmm-agent-<newer>-x64.msi /qn
+
+  The service itself is registered by `rmm-agent.exe install` in its in-place mode, so the
+  service definition, recovery actions and ACLs are identical whether the
+  agent is installed by MSI, by script, or by hand.
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package Name="AI-RMM Agent"
+           Manufacturer="AI-RMM"
+           Version="$(var.Version)"
+           UpgradeCode="347945c9-3383-4dd6-bcb6-e08675243eb9"
+           Scope="perMachine"
+           Compressed="yes"
+           InstallerVersion="500">
+
+    <MajorUpgrade DowngradeErrorMessage="A newer version of [ProductName] is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+
+    <Property Id="SERVER_URL" Secure="yes" />
+    <Property Id="ENROLL_TOKEN" Secure="yes" Hidden="yes" />
+    <Property Id="SERVER_PUBKEY" Secure="yes" />
+    <Property Id="TLS_PIN" Secure="yes" />
+    <Property Id="ARPNOMODIFY" Value="1" />
+    <Property Id="ARPNOREPAIR" Value="1" />
+
+    <StandardDirectory Id="ProgramFiles6432Folder">
+      <Directory Id="INSTALLFOLDER" Name="AIRMM">
+        <Component Id="AgentExeComponent">
+          <File Id="AgentExe" Name="rmm-agent.exe" Source="$(var.AgentExe)" KeyPath="yes" />
+        </Component>
+      </Directory>
+    </StandardDirectory>
+
+    <Feature Id="Main" Title="AI-RMM Agent" Level="1">
+      <ComponentRef Id="AgentExeComponent" />
+    </Feature>
+
+    <!-- Fresh install with settings on the command line. -->
+    <CustomAction Id="InstallAgent" FileRef="AgentExe"
+                  ExeCommand="install --in-place --server &quot;[SERVER_URL]&quot; --token &quot;[ENROLL_TOKEN]&quot; --pubkey &quot;[SERVER_PUBKEY]&quot; --tls-pin &quot;[TLS_PIN]&quot;"
+                  Execute="deferred" Impersonate="no" Return="check" HideTarget="yes" />
+    <!-- Upgrade / reinstall without settings: reuse %ProgramData%\AIRMM\agent.json. -->
+    <CustomAction Id="ReinstallAgent" FileRef="AgentExe"
+                  ExeCommand="install --in-place"
+                  Execute="deferred" Impersonate="no" Return="check" />
+    <!-- Remove the service (config is kept so a reinstall keeps the same identity). -->
+    <CustomAction Id="UninstallAgent" FileRef="AgentExe"
+                  ExeCommand="uninstall"
+                  Execute="deferred" Impersonate="no" Return="ignore" />
+
+    <InstallExecuteSequence>
+      <Custom Action="UninstallAgent" Before="RemoveFiles" Condition="REMOVE~=&quot;ALL&quot;" />
+      <Custom Action="InstallAgent" After="InstallFiles" Condition="NOT REMOVE~=&quot;ALL&quot; AND SERVER_URL" />
+      <Custom Action="ReinstallAgent" After="InstallAgent" Condition="NOT REMOVE~=&quot;ALL&quot; AND NOT SERVER_URL" />
+    </InstallExecuteSequence>
+  </Package>
+</Wix>

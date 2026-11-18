@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "ai-rmm": {
+      "type": "http",
+      "url": "https://rmm.corp.local:8443/mcp",
+      "headers": { "Authorization": "Bearer ${AIRMM_API_KEY}" }
+    }
+  }
+}

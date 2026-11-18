@@ -1,0 +1,63 @@
+# Written for ai-rmm as the repository root (it is inert while ai-rmm/ lives
+# inside another repo; GitHub only reads .github/ at the repo root).
+name: ai-rmm
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with: { go-version: '1.24.x' }
+      - run: go vet ./...
+      - run: GOOS=windows go vet ./...
+      - run: go test -race -count=1 ./...
+
+  # Proves the code still compiles with Go 1.20 (the Win7/2008R2 toolchain).
+  legacy-compat:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with: { go-version: '1.20.14' }
+      - run: GOOS=windows GOARCH=amd64 go build ./cmd/rmm-agent
+      - run: go test -count=1 ./...
+
+  build:
+    needs: [test, legacy-compat]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: actions/setup-go@v5
+        with: { go-version: '1.20.14' }
+      - run: echo "GO_LEGACY=$(go env GOROOT)/bin/go" >> "$GITHUB_ENV"
+      - uses: actions/setup-go@v5
+        with: { go-version: '1.24.x' }
+      - run: ./scripts/build.sh
+        env:
+          VERSION: ${{ github.ref_type == 'tag' && github.ref_name || format('0.0.{0}', github.run_number) }}
+      - uses: actions/upload-artifact@v4
+        with: { name: dist, path: dist/ }
+
+  msi:
+    needs: build
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with: { name: dist, path: dist }
+      - run: dotnet tool install --global wix --version 5.0.2
+      - shell: pwsh
+        run: ./scripts/build-msi.ps1 -Version '${{ github.ref_type == 'tag' && github.ref_name || format('0.0.{0}', github.run_number) }}'
+      - uses: actions/upload-artifact@v4
+        with: { name: msi, path: dist/*.msi }

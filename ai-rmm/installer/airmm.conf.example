@@ -1,0 +1,8 @@
+# Read by Install-AIRMMAgent.ps1 -ConfigFile. For GPO deployment put this next
+# to the script on NETLOGON/SYSVOL. It is readable by every domain computer:
+# use a dedicated enrollment token with a short TTL and a "gpo-rollout" group,
+# and revoke/expire it once rollout is complete.
+server = https://rmm.corp.local:8443
+token  = et_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+pubkey = BASE64PUBLICKEY=
+tlspin = 0000000000000000000000000000000000000000000000000000000000000000

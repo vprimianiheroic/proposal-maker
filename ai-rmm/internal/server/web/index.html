@@ -1,0 +1,180 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AI-RMM Console</title>
+<style>
+:root { --bg:#f6f7f9; --fg:#1d2330; --muted:#667085; --card:#fff; --line:#e3e6eb; --accent:#2457d6; --ok:#1a7f45; --warn:#b26a00; --bad:#c0362c; }
+@media (prefers-color-scheme: dark) { :root { --bg:#12151b; --fg:#e6e9ef; --muted:#98a2b3; --card:#1b2029; --line:#2c3340; --accent:#6d97ff; --ok:#4cc38a; --warn:#f0b54a; --bad:#ff7b72; } }
+* { box-sizing:border-box; }
+body { margin:0; font:14px/1.45 system-ui,-apple-system,Segoe UI,sans-serif; background:var(--bg); color:var(--fg); }
+header { display:flex; gap:16px; align-items:center; padding:12px 20px; border-bottom:1px solid var(--line); background:var(--card); flex-wrap:wrap; }
+header h1 { font-size:16px; margin:0; }
+nav button { background:none; border:none; color:var(--muted); padding:6px 10px; cursor:pointer; font:inherit; border-radius:6px; }
+nav button.on { color:var(--fg); background:var(--bg); font-weight:600; }
+main { padding:20px; max-width:1300px; margin:auto; }
+table { width:100%; border-collapse:collapse; background:var(--card); border:1px solid var(--line); border-radius:8px; overflow:hidden; }
+th, td { text-align:left; padding:8px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+th { font-size:12px; color:var(--muted); font-weight:600; text-transform:uppercase; letter-spacing:.03em; }
+tr:last-child td { border-bottom:none; }
+.pill { display:inline-block; padding:1px 8px; border-radius:99px; font-size:12px; border:1px solid var(--line); margin:1px; }
+.ok { color:var(--ok); } .warn { color:var(--warn); } .bad { color:var(--bad); } .muted { color:var(--muted); }
+button.act { border:1px solid var(--line); background:var(--card); color:var(--fg); border-radius:6px; padding:4px 10px; cursor:pointer; font:inherit; }
+button.primary { background:var(--accent); color:#fff; border-color:var(--accent); }
+button.danger { color:var(--bad); }
+input, select, textarea { font:inherit; padding:6px 8px; border:1px solid var(--line); border-radius:6px; background:var(--card); color:var(--fg); }
+pre { white-space:pre-wrap; word-break:break-word; background:var(--bg); padding:8px; border-radius:6px; max-height:360px; overflow:auto; margin:4px 0; font-size:12px; }
+.row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-bottom:12px; }
+.card { background:var(--card); border:1px solid var(--line); border-radius:8px; padding:16px; margin-bottom:16px; }
+#login { max-width:420px; margin:80px auto; }
+.wrap { overflow-x:auto; }
+</style>
+</head>
+<body>
+<div id="login" class="card" hidden>
+  <h2>AI-RMM Console</h2>
+  <p class="muted">Paste an <b>admin</b> API key. It is kept in this browser tab only.</p>
+  <div class="row"><input id="key" type="password" placeholder="rk_..." style="flex:1"><button class="act primary" onclick="login()">Sign in</button></div>
+  <div id="loginErr" class="bad"></div>
+</div>
+<div id="app" hidden>
+<header>
+  <h1>AI-RMM</h1>
+  <nav id="nav"></nav>
+  <span style="flex:1"></span>
+  <span id="who" class="muted"></span>
+  <button class="act" onclick="logout()">Sign out</button>
+</header>
+<main id="main"></main>
+</div>
+<script>
+const tabs = ["Approvals","Agents","Jobs","Tools","Enroll","Audit"];
+let tab = "Approvals", key = sessionStorage.getItem("rmmkey") || "";
+const $ = s => document.querySelector(s);
+const esc = v => String(v ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const ts = u => u ? new Date(u*1000).toLocaleString() : "";
+async function api(path, opts={}) {
+  const r = await fetch("/api/v1/"+path, {...opts, headers:{"Authorization":"Bearer "+key, "Content-Type":"application/json"}});
+  const j = await r.json().catch(()=>({}));
+  if (!r.ok) throw new Error(j.error || r.statusText);
+  return j;
+}
+async function login() {
+  key = $("#key").value.trim();
+  try { const w = await api("whoami"); sessionStorage.setItem("rmmkey", key); start(w); }
+  catch(e) { $("#loginErr").textContent = e.message; }
+}
+function logout() { sessionStorage.removeItem("rmmkey"); location.reload(); }
+function start(w) {
+  $("#login").hidden = true; $("#app").hidden = false;
+  $("#who").textContent = w.name + " (" + w.role + ") · server " + w.server_version;
+  $("#nav").innerHTML = tabs.map(t => `<button data-t="${t}">${t}</button>`).join("");
+  $("#nav").onclick = e => { if (e.target.dataset.t) { tab = e.target.dataset.t; render(); } };
+  render(); setInterval(() => { if (tab==="Approvals"||tab==="Agents") render(); }, 10000);
+}
+const statusClass = s => ({succeeded:"ok",queued:"muted",dispatched:"muted",pending_approval:"warn",failed:"bad",timeout:"bad",rejected:"bad",denied:"bad",expired:"muted"}[s]||"");
+async function render() {
+  document.querySelectorAll("#nav button").forEach(b => b.classList.toggle("on", b.dataset.t===tab));
+  const m = $("#main");
+  try { m.innerHTML = await views[tab](); } catch(e) { m.innerHTML = `<div class="card bad">${esc(e.message)}</div>`; }
+}
+const views = {
+  async Approvals() {
+    const jobs = await api("approvals");
+    if (!jobs.length) return `<div class="card muted">Nothing is waiting for approval.</div>`;
+    const batches = {};
+    jobs.forEach(j => (batches[j.batch_id] ||= []).push(j));
+    return Object.entries(batches).map(([b, js]) => { const j = js[0]; return `
+      <div class="card">
+        <div class="row"><b>${esc(j.tool)}</b><span class="pill warn">${esc(j.risk)}</span>
+          <span class="muted">requested by ${esc(j.requested_by)} · ${ts(j.created_at)} · ${js.length} machine(s)</span></div>
+        <div><b>Reason:</b> ${esc(j.reason)}</div>
+        <div class="muted">Why approval: ${esc(j.approval_reason)}</div>
+        <div><b>Targets:</b> ${js.map(x=>`<span class="pill">${esc(x.hostname)}</span>`).join("")}</div>
+        <div><b>Params:</b><pre>${esc(JSON.stringify(j.params, null, 1))}</pre></div>
+        <details><summary>Script that will run</summary><pre>${esc(j.script)}</pre></details>
+        <div class="row" style="margin-top:8px">
+          <button class="act primary" onclick="decide('${b}',true)">Approve all ${js.length}</button>
+          <button class="act danger" onclick="decide('${b}',false)">Deny</button>
+        </div>
+      </div>`; }).join("");
+  },
+  async Agents() {
+    const as = await api("agents");
+    return `<div class="wrap"><table><tr><th>Host</th><th>State</th><th>OS</th><th>IPs</th><th>Groups</th><th>Auto-approve</th><th>Agent</th><th>Notes</th><th></th></tr>` +
+      as.map(a => `<tr>
+        <td><b>${esc(a.hostname)}</b><div class="muted">${esc(a.id)}</div></td>
+        <td class="${a.online?"ok":"bad"}">${a.online?"online":"offline"}<div class="muted">${esc(a.last_seen)}</div></td>
+        <td>${esc(a.facts.os_name)}<div class="muted">${esc(a.facts.os_version)} · ${esc(a.facts.product_type)}</div></td>
+        <td>${(a.facts.ips||[]).map(esc).join("<br>")}</td>
+        <td>${(a.groups||[]).map(g=>`<span class="pill">${esc(g)}</span>`).join("")}</td>
+        <td>${esc(a.effective_policy.auto_approve_max_risk)}</td>
+        <td>${esc(a.version)} ${esc(a.variant)}</td>
+        <td style="max-width:260px">${esc(a.notes)}</td>
+        <td><button class="act" onclick="editGroups('${a.id}','${esc((a.groups||[]).join(","))}')">Groups</button>
+            <button class="act ${a.disabled?"":"danger"}" onclick="toggle('${a.id}',${!a.disabled})">${a.disabled?"Enable":"Disable"}</button></td>
+      </tr>`).join("") + `</table></div>`;
+  },
+  async Jobs() {
+    const js = await api("jobs?limit=100");
+    return `<div class="wrap"><table><tr><th>When</th><th>Host</th><th>Tool</th><th>Status</th><th>By / reason</th><th>Output</th></tr>` +
+      js.map(j => `<tr><td>${ts(j.created_at)}</td><td>${esc(j.hostname)}</td><td>${esc(j.tool)}</td>
+        <td class="${statusClass(j.status)}">${esc(j.status)}</td>
+        <td><div>${esc(j.requested_by)}</div><div class="muted">${esc(j.reason)}</div></td>
+        <td>${j.result ? `<details><summary>exit ${j.result.exit_code}</summary><pre>${esc(j.result.data ? JSON.stringify(j.result.data,null,1) : j.result.stdout)}</pre>${j.result.stderr?`<pre class="bad">${esc(j.result.stderr)}</pre>`:""}</details>` : ""}</td></tr>`).join("") + `</table></div>`;
+  },
+  async Tools() {
+    const ts_ = await api("tools");
+    return `<div class="wrap"><table><tr><th>Tool</th><th>Risk</th><th>Status</th><th>Source</th><th>Description</th><th></th></tr>` +
+      ts_.map(t => `<tr><td><b>${esc(t.name)}</b> <span class="muted">v${t.version}</span></td>
+        <td>${esc(t.risk)}</td><td class="${t.status==="draft"?"warn":""}">${esc(t.status)}</td><td>${esc(t.source)}<div class="muted">${esc(t.author)}</div></td>
+        <td>${esc(t.description)}<details><summary>source</summary><pre>${esc(t.script)}</pre><pre>${esc(JSON.stringify(t.params,null,1))}</pre></details></td>
+        <td>${t.source==="custom" ? (t.status==="draft"
+          ? `<button class="act primary" onclick="toolAct('${t.name}','publish')">Publish</button>`
+          : `<button class="act" onclick="toolAct('${t.name}','unpublish')">Unpublish</button>`) +
+          ` <button class="act danger" onclick="toolDel('${t.name}')">Delete</button>` : ""}</td></tr>`).join("") + `</table></div>`;
+  },
+  async Enroll() {
+    return `<div class="card"><h3>Create enrollment token</h3>
+      <p class="muted">Agents present this once at install time. Groups set here are applied to every machine that enrolls with it (e.g. <code>ot</code>, <code>site-plant1</code>).</p>
+      <div class="row"><input id="etName" placeholder="name (e.g. plant1-floor)"><input id="etGroups" placeholder="groups, comma separated">
+      <input id="etTTL" type="number" value="168" style="width:90px" title="TTL hours"> h
+      <input id="etMax" type="number" value="0" style="width:90px" title="max uses (0 = unlimited)"> uses
+      <button class="act primary" onclick="mkToken()">Create</button></div><pre id="etOut" hidden></pre></div>`;
+  },
+  async Audit() {
+    const a = await api("audit?n=300");
+    return `<pre style="max-height:none">${esc(a.reverse().map(x => JSON.stringify(x)).join("\n"))}</pre>`;
+  },
+};
+async function decide(batch, approve) {
+  const note = approve ? "" : (prompt("Reason for denying?") || "");
+  try { await api("approvals", {method:"POST", body:JSON.stringify({batch_id:batch, approve, note})}); } catch(e) { alert(e.message); }
+  render();
+}
+async function editGroups(id, cur) {
+  const v = prompt("Groups (comma separated). Groups drive approval policy.", cur); if (v === null) return;
+  try { await api("agents/"+id, {method:"PATCH", body:JSON.stringify({groups:v.split(",").map(s=>s.trim()).filter(Boolean)})}); } catch(e) { alert(e.message); }
+  render();
+}
+async function toggle(id, disabled) {
+  if (disabled && !confirm("Disable this agent? It will stop receiving jobs.")) return;
+  try { await api("agents/"+id, {method:"PATCH", body:JSON.stringify({disabled})}); } catch(e) { alert(e.message); }
+  render();
+}
+async function toolAct(n, a) {
+  if (a==="publish" && !confirm("Publish "+n+"? Have you read its source? Once published, it runs under normal risk policy.")) return;
+  try { await api("tools/"+n+"/"+a, {method:"POST"}); } catch(e) { alert(e.message); } render();
+}
+async function toolDel(n) { if (!confirm("Delete tool "+n+"?")) return; try { await api("tools/"+n, {method:"DELETE"}); } catch(e) { alert(e.message); } render(); }
+async function mkToken() {
+  try {
+    const r = await api("enroll-tokens", {method:"POST", body:JSON.stringify({name:$("#etName").value, groups:$("#etGroups").value.split(",").map(s=>s.trim()).filter(Boolean), ttl_hours:+$("#etTTL").value, max_uses:+$("#etMax").value})});
+    const o = $("#etOut"); o.hidden = false; o.textContent = "Token (shown once): " + r.token;
+  } catch(e) { alert(e.message); }
+}
+(async () => { if (key) { try { start(await api("whoami")); return; } catch(e) {} } $("#login").hidden = false; })();
+</script>
+</body>
+</html>
