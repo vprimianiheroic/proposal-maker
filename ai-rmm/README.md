@@ -88,6 +88,7 @@ AI-written tools, manage groups and create enrollment tokens.
 | [docs/SECURITY.md](docs/SECURITY.md) | Threat model, trust boundaries, approval policy, hardening checklist |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | How the pieces fit, the wire protocol, job lifecycle, extending the code |
 | [docs/WRITING-TOOLS.md](docs/WRITING-TOOLS.md) | Writing snap-in tools (for humans and the AI) |
+| [docs/LAB-ACCEPTANCE.md](docs/LAB-ACCEPTANCE.md) | Checklist for the lab sign-off that the automated Windows suite can't cover (AD, two-machine push, legacy OS) |
 | [docs/AI-OPERATOR-GUIDE.md](docs/AI-OPERATOR-GUIDE.md) | Drop-in `CLAUDE.md` for the AI session that runs the fleet |
 
 ## Built-in tools
@@ -170,6 +171,12 @@ deploy/               systemd unit, MCP client config example
 go test -race ./...          # unit + end-to-end tests (server, agent, MCP, approvals, signing)
 GOOS=windows go vet ./...
 ```
+
+Real-Windows integration (`test/windows/integration.ps1`) runs in GitHub
+Actions on Windows Server 2022 and 2025 plus the Go 1.20 legacy build. It
+installs the service, runs every tool, and exercises the watchdog,
+self-update/rollback, push install, MSI and GPO-script paths. It is
+destructive, so only run it on CI runners or disposable VMs.
 
 The module targets **Go 1.20** language and stdlib so the legacy agent still
 compiles with the last toolchain that supports Windows 7 and 2008 R2. Do not
