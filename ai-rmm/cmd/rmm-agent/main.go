@@ -136,6 +136,7 @@ func runAgent(ctx context.Context, cfgPath string) (restart bool) {
 		log.Printf("init: %v", err)
 		return false
 	}
+	a.SelfUpdate = agent.IsService()
 	if err := a.Run(ctx); err != nil {
 		log.Printf("agent stopped: %v", err)
 	}

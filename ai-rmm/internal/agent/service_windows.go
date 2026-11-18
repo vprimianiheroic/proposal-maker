@@ -4,6 +4,7 @@ package agent
 
 import (
 	"context"
+	"debug/pe"
 	"errors"
 	"fmt"
 	"io"
@@ -361,9 +362,12 @@ func Watchdog() error {
 	if age, ok := markerAge(marker); ok && age > 15*time.Minute {
 		return restore("self-update never reached the server within 15 minutes")
 	}
-	// AV quarantine or deletion of the agent binary.
+	// AV quarantine, deletion or corruption of the agent binary.
 	if !fileExists(agentExe) {
 		return restore("agent binary is missing")
+	}
+	if err := validExe(agentExe); err != nil {
+		return restore(fmt.Sprintf("agent binary is not a valid executable (%v)", err))
 	}
 
 	st, err := s.Query()
@@ -375,7 +379,7 @@ func Watchdog() error {
 		logf("agent service was stopped; starting")
 		err := s.Start()
 		var en windows.Errno
-		if errors.As(err, &en) && (en == windows.ERROR_FILE_NOT_FOUND || en == windows.ERROR_PATH_NOT_FOUND || en == windows.ERROR_BAD_EXE_FORMAT) {
+		if errors.As(err, &en) && (en == windows.ERROR_FILE_NOT_FOUND || en == windows.ERROR_PATH_NOT_FOUND || en == windows.ERROR_BAD_EXE_FORMAT || en == 216 /* ERROR_EXE_MACHINE_TYPE_MISMATCH */) {
 			return restore(fmt.Sprintf("agent binary will not start (%v)", err))
 		}
 		return err
@@ -523,4 +527,20 @@ func copyFile(src, dst string) error {
 		return err
 	}
 	return out.Close()
+}
+
+// validExe checks the file parses as a PE image for this machine's
+// architecture family, catching truncated or overwritten binaries before
+// the service manager tries (and fails) to start them.
+func validExe(path string) error {
+	f, err := pe.Open(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	switch f.Machine {
+	case pe.IMAGE_FILE_MACHINE_AMD64, pe.IMAGE_FILE_MACHINE_I386, pe.IMAGE_FILE_MACHINE_ARM64:
+		return nil
+	}
+	return fmt.Errorf("unexpected machine type 0x%x", f.Machine)
 }

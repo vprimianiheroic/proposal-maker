@@ -328,7 +328,7 @@ Step 'network monitoring: device goes up, then down' {
   $d = Api POST 'devices' @{ name = 'itest-loopback'; address = '127.0.0.1'; kind = 'server'; collector_agent_id = $AgentId; interval_sec = 30; ping = $true; tcp_ports = @($Port) }
   Wait-Until { (Api GET "devices/$($d.id)").status.state -eq 'up' } 150 'device up'
   $dv = Api GET "devices/$($d.id)"
-  Assert ($dv.status.latency_ms -ge 0 -and $dv.status.ping_ok) "status $($dv.status | ConvertTo-Json -Compress)"
+  Assert ($dv.status.ping_ok -and $dv.status.ports.$Port) "status $($dv.status | ConvertTo-Json -Compress)"
   $d2 = Api POST 'devices' @{ name = 'itest-closed-port'; address = '127.0.0.1'; kind = 'other'; collector_agent_id = $AgentId; interval_sec = 30; tcp_ports = @(1) }
   Wait-Until { (Api GET "devices/$($d2.id)").status.state -eq 'down' } 180 'device down after two failed checks'
   Assert (@(Api GET 'events?type=device_down' | Where-Object { $_.subject -eq 'itest-closed-port' }).Count -ge 1) 'device_down event'
@@ -390,7 +390,7 @@ Step 'watchdog rolls back a broken update' {
   $before = [DateTimeOffset]::UtcNow
   Wait-Until { (Agent $AgentId).online -and [DateTimeOffset]::Parse((Agent $AgentId).last_seen) -ge $before.AddSeconds(-2) } 90 'agent reporting after rollback'
   Assert (-not (Test-Path "$PD\update-pending.json")) 'marker cleared'
-  Get-Content "$PD\watchdog.log" -Tail 5 | ForEach-Object { Log "watchdog.log: $_" }
+  try { Get-Content "$PD\watchdog.log" -Tail 5 -ErrorAction Stop | ForEach-Object { Log "watchdog.log: $_" } } catch { Log "watchdog.log unreadable: $($_.Exception.Message)" }
 }
 
 Step 'watchdog repairs a corrupt binary without an update marker' {
@@ -424,7 +424,12 @@ Step 'push install: prepare local admin account and source agent' {
 
 function Deploy([hashtable]$Params) {
   $Params.computers = @($env:COMPUTERNAME)
-  (Run-Tool 'deploy_agent' $Params @($SourceId) 400)[0]
+  $j = (Run-Tool 'deploy_agent' $Params @($SourceId) 400)[0]
+  if ($null -eq $j.result.data.results) {
+    $tail = (Get-Content "$WorkDir\source-agent.log" -Tail 15 -ErrorAction SilentlyContinue) -join "`n"
+    throw "deploy job has no per-computer results: status=$($j.status) stderr=$($j.result.stderr)`nsource agent log:`n$tail"
+  }
+  $j
 }
 
 Step 'push install: wrong password fails at authenticate' {

@@ -49,6 +49,11 @@ type Agent struct {
 	// RestartRequested is set when a self-update has been staged; the caller
 	// should exit with a non-zero code so the service manager restarts it.
 	RestartRequested bool
+	// SelfUpdate enables applying server-assigned builds. Only safe when a
+	// service manager will restart the process afterwards, so main sets it
+	// for the Windows service and leaves it off for foreground `run`.
+	SelfUpdate  bool
+	updateNoted string
 }
 
 func New(cfg *Config, version, variant string) (*Agent, error) {
@@ -283,7 +288,11 @@ func (a *Agent) Run(ctx context.Context) error {
 		for i := range resp.Jobs {
 			a.start(ctx, resp.Jobs[i])
 		}
-		if resp.Update != nil && len(a.runningIDs()) == 0 {
+		if resp.Update != nil && !a.SelfUpdate && a.updateNoted != resp.Update.Version {
+			a.updateNoted = resp.Update.Version
+			log.Printf("update %s available; not applied in foreground mode (only the service self-updates)", resp.Update.Version)
+		}
+		if resp.Update != nil && a.SelfUpdate && len(a.runningIDs()) == 0 {
 			if err := a.applyUpdate(ctx, resp.Update); err != nil {
 				log.Printf("self-update to %s failed: %v", resp.Update.Version, err)
 				sleepCtx(ctx, 5*time.Minute) // don't hammer the server with retries
