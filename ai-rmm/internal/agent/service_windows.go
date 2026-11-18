@@ -88,12 +88,12 @@ func SecureDir(dir string) error {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
 	}
-	out, err := exec.Command("icacls.exe", dir, "/inheritance:r",
-		"/grant:r", "*S-1-5-18:(OI)(CI)F", // SYSTEM
-		"/grant:r", "*S-1-5-32-544:(OI)(CI)F", // BUILTIN\Administrators
-		"/T", "/C", "/Q").CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("icacls: %v: %s", err, out)
+	// Set the DACL through the security API rather than icacls (whose
+	// multiple-/grant handling left Administrators out on Server 2022).
+	// SetNamedSecurityInfo also propagates the inheritable ACEs to files
+	// already in the folder.
+	if err := protectDir(dir); err != nil {
+		return fmt.Errorf("secure %s: %w", dir, err)
 	}
 	return nil
 }

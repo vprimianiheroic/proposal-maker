@@ -39,6 +39,10 @@ function Read-Shared([string]$Path, [int]$Tail = 25) {
 }
 
 function Dump-AgentLogs([string]$Why) {
+  foreach ($m in Get-ChildItem $WorkDir -Filter 'msi-*.log' -ErrorAction SilentlyContinue) {
+    Write-Host "----- $($m.Name) (custom action lines)"
+    Get-Content $m.FullName -Encoding Unicode -ErrorAction SilentlyContinue | Select-String -Pattern 'CustomAction|rmm-agent|Return value 3|error' | Select-Object -Last 25 | ForEach-Object { Write-Host $_.Line }
+  }
   foreach ($f in "$PD\agent.log", "$PD\watchdog.log", "$WorkDir\source-agent.log") {
     if (Test-Path $f) { Write-Host "----- $f ($Why)"; Write-Host (Read-Shared $f 30) }
   }
@@ -160,6 +164,9 @@ Step 'Agent install as service' {
   Assert (Test-Path "$PF\rmm-agent.exe") 'binary in Program Files'
   Assert (Test-Path "$PF\rmm-watchdog.exe") 'watchdog copy'
   $acl = (Get-Acl $PD).Access | ForEach-Object { $_.IdentityReference.Value }
+  Log "ProgramData\AIRMM ACL: $($acl -join ', ')"
+  Assert ($acl -match 'Administrators') "Administrators must keep access: $($acl -join ', ')"
+  Assert ((Read-Shared "$PD\agent.json" 1) -notmatch 'unreadable') "admin can read agent files"
   Assert (-not ($acl -match 'Users|Everyone|Authenticated')) "ProgramData ACL too open: $($acl -join ', ')"
   $xml = (& schtasks.exe /query /tn "AIRMM Watchdog" /xml) -join "`n"
   Assert ($xml -match '<DisallowStartIfOnBatteries>false') 'watchdog task runs on battery'
@@ -247,6 +254,24 @@ foreach ($c in $toolCases) {
     }
     "$($j.status) in $($j.result.finished_at - $j.result.started_at)s"
   }
+}
+
+Step 'diag: network_config sections timing' {
+  $parts = [ordered]@{
+    nics    = '$sw=[Diagnostics.Stopwatch]::StartNew(); $n=@([System.Net.NetworkInformation.NetworkInterface]::GetAllNetworkInterfaces()); [pscustomobject]@{count=$n.Count; ms=$sw.ElapsedMilliseconds}'
+    ipprops = '$sw=[Diagnostics.Stopwatch]::StartNew(); foreach($n in [System.Net.NetworkInformation.NetworkInterface]::GetAllNetworkInterfaces()){ $p=$n.GetIPProperties(); $null=$p.DnsAddresses; $null=$p.GatewayAddresses; $null=$p.UnicastAddresses }; [pscustomobject]@{ms=$sw.ElapsedMilliseconds}'
+    dhcp    = '$sw=[Diagnostics.Stopwatch]::StartNew(); foreach($n in [System.Net.NetworkInformation.NetworkInterface]::GetAllNetworkInterfaces()){ $null=$n.GetIPProperties().DhcpServerAddresses }; [pscustomobject]@{ms=$sw.ElapsedMilliseconds}'
+    v4      = '$sw=[Diagnostics.Stopwatch]::StartNew(); foreach($n in [System.Net.NetworkInformation.NetworkInterface]::GetAllNetworkInterfaces()){ try { $null=$n.GetIPProperties().GetIPv4Properties() } catch {} }; [pscustomobject]@{ms=$sw.ElapsedMilliseconds}'
+    route   = '$sw=[Diagnostics.Stopwatch]::StartNew(); $r=Invoke-RmmNative "route.exe" "print","-4"; [pscustomobject]@{lines=$r.lines.Count; ms=$sw.ElapsedMilliseconds}'
+    speedmac = '$sw=[Diagnostics.Stopwatch]::StartNew(); foreach($n in [System.Net.NetworkInformation.NetworkInterface]::GetAllNetworkInterfaces()){ $null=$n.Speed; $null=$n.GetPhysicalAddress().GetAddressBytes(); $null=$n.OperationalStatus }; [pscustomobject]@{ms=$sw.ElapsedMilliseconds}'
+    hosts   = '$sw=[Diagnostics.Stopwatch]::StartNew(); $h=@(Get-Content "$env:SystemRoot\System32\drivers\etc\hosts"); [pscustomobject]@{lines=$h.Count; ms=$sw.ElapsedMilliseconds}'
+    tojson  = '$sw=[Diagnostics.Stopwatch]::StartNew(); $x=foreach($n in [System.Net.NetworkInformation.NetworkInterface]::GetAllNetworkInterfaces()){ [pscustomobject]@{ n=$n.Name; ip=@($n.GetIPProperties().UnicastAddresses | ForEach-Object { "$($_.Address)/$($_.PrefixLength)" }) } }; $null = $x | ConvertTo-Json -Depth 8; [pscustomobject]@{ms=$sw.ElapsedMilliseconds}'
+  }
+  $out = foreach ($k in $parts.Keys) {
+    $j = (Run-Tool -Tool '' -Script $parts[$k] -Timeout 25 -Wait 40)[0]
+    "$k=$($j.status):$($j.result.data | ConvertTo-Json -Compress)"
+  }
+  $out -join ' | '
 }
 
 Step 'tool process_kill (spawned process)' {
@@ -438,7 +463,9 @@ Step 'push install: prepare local admin account and source agent' {
   $tok = (Api POST 'enroll-tokens' @{ name = 'itest-source'; groups = @('itest-source') }).token
   $srcDir = Join-Path $WorkDir 'source'
   & "$WorkDir\rmm-agent.exe" configure --config "$srcDir\agent.json" --server $Url --token $tok --pubkey $PubKey --tls-pin $Pin | Out-Null
-  $p = Start-Process "$WorkDir\rmm-agent.exe" -ArgumentList 'run', '--config', "$srcDir\agent.json", '--log', "$WorkDir\source-agent.log" -PassThru -WindowStyle Hidden
+  $p = Start-Process "$WorkDir\rmm-agent.exe" -ArgumentList 'run', '--config', "$srcDir\agent.json", '--log', "$WorkDir\source-agent.log" -PassThru -NoNewWindow `
+        -RedirectStandardError "$WorkDir\source-agent.stderr.log" -RedirectStandardOutput "$WorkDir\source-agent.stdout.log"
+  $script:SourceProc = $p
   $script:procs += $p
   Wait-Until { @(Agents | Where-Object { $_.groups -contains 'itest-source' -and $_.online }).Count -eq 1 } 60 'source agent enrolled'
   $script:SourceId = (Agents | Where-Object { $_.groups -contains 'itest-source' })[0].id
@@ -449,7 +476,14 @@ function Deploy([hashtable]$Params) {
   $j = (Run-Tool 'deploy_agent' $Params @($SourceId) 400)[0]
   if ($null -eq $j.result.data.results) {
     $src = Agent $SourceId
-    throw "deploy job has no per-computer results: status=$($j.status) stderr=$($j.result.stderr); source agent online=$($src.online) last_seen=$($src.last_seen)"
+    $alive = -not $script:SourceProc.HasExited
+    if ($alive) {
+      New-Item -ItemType File -Force "$WorkDir\source\dump-stacks" | Out-Null
+      Start-Sleep 8
+    } else { Log "source agent process exited with code $($script:SourceProc.ExitCode)" }
+    Write-Host "----- source agent stderr:"; Write-Host (Read-Shared "$WorkDir\source-agent.stderr.log" 60)
+    Write-Host "----- source agent log (with goroutine dump):"; Write-Host (Read-Shared "$WorkDir\source-agent.log" 400)
+    throw "deploy job has no per-computer results (source process alive=$alive): status=$($j.status) stderr=$($j.result.stderr); source agent online=$($src.online) last_seen=$($src.last_seen)"
   }
   $j
 }

@@ -53,7 +53,7 @@ func main() {
 		logPath := fs.String("log", "", "also write the log to this file (size-capped)")
 		_ = fs.Parse(args)
 		if *logPath != "" {
-			log.SetOutput(io.MultiWriter(os.Stderr, &rotatingFile{path: *logPath}))
+			log.SetOutput(&teeWriter{file: &rotatingFile{path: *logPath}})
 		}
 		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 		defer stop()
@@ -203,4 +203,15 @@ func setupFileLog() {
 	_ = os.MkdirAll(dir, 0o700)
 	log.SetOutput(io.Writer(&rotatingFile{path: filepath.Join(dir, "agent.log")}))
 	log.SetFlags(log.LstdFlags | log.LUTC)
+}
+
+// teeWriter writes to the log file first and stderr best-effort, so a
+// detached or broken console can never stop file logging (io.MultiWriter
+// would give up at the first failing writer).
+type teeWriter struct{ file io.Writer }
+
+func (t *teeWriter) Write(p []byte) (int, error) {
+	n, err := t.file.Write(p)
+	_, _ = os.Stderr.Write(p)
+	return n, err
 }

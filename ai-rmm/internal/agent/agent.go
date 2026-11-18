@@ -19,6 +19,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -255,6 +256,7 @@ func (a *Agent) Run(ctx context.Context) error {
 	}
 
 	go a.mon.sender(ctx)
+	go a.debugWatcher(ctx)
 	var lastFacts time.Time
 	backoff = time.Second
 	for ctx.Err() == nil {
@@ -444,4 +446,20 @@ func nextBackoff(d time.Duration) time.Duration {
 		d = 60 * time.Second
 	}
 	return d
+}
+
+// debugWatcher writes every goroutine's stack to the log when a file named
+// "dump-stacks" appears in the data directory (then deletes it). Lets a
+// technician diagnose a wedged agent without killing it.
+func (a *Agent) debugWatcher(ctx context.Context) {
+	trigger := filepath.Join(a.DataDir, "dump-stacks")
+	for sleepCtx(ctx, 5*time.Second) {
+		if _, err := os.Stat(trigger); err != nil {
+			continue
+		}
+		_ = os.Remove(trigger)
+		buf := make([]byte, 1<<20)
+		n := runtime.Stack(buf, true)
+		log.Printf("goroutine dump requested:\n%s", buf[:n])
+	}
 }
